@@ -1,0 +1,30 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Aimyria One runs tray-only: the window is created hidden and shown on demand, so show/hide are the only window permissions it needs.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging",
+    "core:window:allow-is-visible",
+    "core:event:default",
+    "opener:default",
+    "process:allow-exit",
+    "process:allow-restart",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-is-maximized",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-get-all-windows",
+    "core:window:allow-set-always-on-top"
+  ]
+}

@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pin the toolchain: the gnu target cannot be mixed with msvc in one target
+  # dir, and an unpinned default toolchain silently switches target triples.
+  RUST_TOOLCHAIN: 1.95.0-x86_64-pc-windows-gnu
+
+jobs:
+  frontend:
+    name: 前端类型检查与测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm run typecheck
+
+      - name: 前端测试
+        run: pnpm run test:unit
+
+      - name: 前端构建
+        run: pnpm run build:renderer
+
+      # Brand palette, upstream attribution and the no-competitor rule are the
+      # kind of thing that gets broken by a plausible-looking diff, so they are
+      # checked mechanically rather than trusted to review.
+      - name: 品牌与合规检查
+        run: node tools/check_brand.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  rust:
+    name: Rust 检查与测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0-x86_64-pc-windows-gnu
+          target: x86_64-pc-windows-gnu
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+
+      - name: 安装 MinGW-w64
+        run: choco install mingw --no-progress -y
+
+      - name: 设置构建环境
+        run: |
+          echo "CC=gcc" >> $env:GITHUB_ENV
+          echo "AR=ar" >> $env:GITHUB_ENV
+
+      - name: 格式检查
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --lib -- -D warnings
+
+      - name: 编译检查
+        working-directory: src-tauri
+        run: cargo check --lib
+
+      - name: 测试
+        working-directory: src-tauri
+        run: cargo test --lib
+
+  audit:
+    name: 依赖漏洞扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The frontend tree is small enough that pnpm can audit it directly.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - run: pnpm audit --audit-level high
+
+  build:
+    name: 构建安装包
+    needs: [frontend, rust]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0-x86_64-pc-windows-gnu
+          target: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+
+      - name: 安装 MinGW-w64
+        run: choco install mingw --no-progress -y
+
+      - name: 设置构建环境
+        run: |
+          echo "CC=gcc" >> $env:GITHUB_ENV
+          echo "AR=ar" >> $env:GITHUB_ENV
+
+      - name: 恢复前端产物
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # tauri build 会跑 beforeBuildCommand，这里要避免它再构建一次前端，
+      # 所以直接传 --no-bundle 关掉、再单独出安装包。
+      - name: 打包安装程序
+        working-directory: src-tauri
+        run: cargo tauri build --no-bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AimyriaOne-exe
+          path: src-tauri/target/release/aimyria-one.exe
+
+      - name: 生成校验和
+        shell: pwsh
+        run: |
+          $exe = 'src-tauri/target/release/aimyria-one.exe'
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  AimyriaOne-x64-setup.exe" | Out-File -FilePath 'AimyriaOne-x64-setup.exe.sha256' -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AimyriaOne-checksums
+          path: AimyriaOne-x64-setup.exe.sha256

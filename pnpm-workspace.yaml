@@ -1,0 +1,12 @@
+allowBuilds:
+  esbuild: true
+  msw: true
+
+# The Tauri CLI refuses to build when a JS plugin's minor differs from its Rust
+# crate. These four are pinned on both sides; keep the JS resolution here so a
+# routine `pnpm add` cannot drift it again.
+overrides:
+  msw: 2.11.6
+  "@tauri-apps/plugin-dialog": 2.6.0
+  "@tauri-apps/plugin-process": 2.3.1
+  "@tauri-apps/plugin-updater": 2.10.0

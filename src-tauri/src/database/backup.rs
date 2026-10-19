@@ -1,0 +1,1179 @@
+//! 数据库备份和恢复
+//!
+//! 提供 SQL 导出/导入和二进制快照备份功能。
+
+use super::{lock_conn, Database};
+use crate::config::get_app_config_dir;
+use crate::error::AppError;
+use chrono::{Local, Utc};
+use rusqlite::backup::{Backup, StepResult};
+use rusqlite::types::ValueRef;
+use rusqlite::Connection;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use tempfile::{Builder, NamedTempFile};
+
+const CC_SWITCH_SQL_EXPORT_HEADER: &str = "-- CC Switch SQLite 导出";
+
+/// Bound combined INSERT batches while still amortizing statement parsing.
+/// A row larger than this cap is emitted alone because it cannot be split.
+const INSERT_BATCH_MAX_ROWS: usize = 200;
+const INSERT_BATCH_MAX_BYTES: usize = 1024 * 1024;
+
+/// Serialize every operation that observes or mutates the database-backup
+/// directory. Always acquire this guard before `Database.conn`.
+static BACKUP_FILE_OPERATION_LOCK: Mutex<()> = Mutex::new(());
+type BackupFileOperationGuard = MutexGuard<'static, ()>;
+
+fn lock_backup_file_operations() -> Result<BackupFileOperationGuard, AppError> {
+    BACKUP_FILE_OPERATION_LOCK
+        .lock()
+        .map_err(|e| AppError::Database(format!("Backup file operation lock failed: {e}")))
+}
+
+/// `dump_sql` 会写出的 PRAGMA。其余 PRAGMA 一律拒绝——`temp_store_directory`
+/// 能把临时文件重定向到任意目录，`writable_schema` 能绕过 schema 完整性检查。
+const IMPORT_ALLOWED_PRAGMAS: &[&str] = &["foreign_keys", "user_version"];
+
+/// 执行外部 SQL 期间的 authorizer：拒绝一切能**离开临时数据库文件**的动作。
+///
+/// 头部校验（`validate_cc_switch_sql_export`）只比较一个注释前缀，任何人都能在
+/// 合法前缀后面接着写别的语句。`ATTACH DATABASE '/path/x.db'` 的副作用发生在
+/// 暂存库的 schema 校验之前，导入即使最终失败，文件也已经被创建；而 `settings`
+/// 表不在 `SYNC_SKIP_TABLES` / `SYNC_PRESERVE_TABLES` 之列，WebDAV/S3 同步会走
+/// 同一条 `import_sql_string_inner`，所以这条路径的输入不可信。
+///
+/// 为什么是 authorizer 而不是「扫描 ATTACH 关键字」：字符串扫描会被 `/*x*/ATTACH`、
+/// 大小写、换行绕过，还漏掉 `VACUUM INTO`。authorizer 在 prepare 阶段按**解析结果**
+/// 回调，绕不过语法层。
+///
+/// 为什么是「拒绝越界动作」而不是「只放行 dump_sql 的语句」：这段 SQL 跑在
+/// `NamedTempFile` 建的一次性库上，而那个库的全部内容本来就由这份 SQL 决定。
+/// 因此 `DELETE` / `DROP` / `UPDATE` 给不了攻击者任何新东西——**唯一有意义的边界
+/// 是那个临时文件本身**。按 dump_sql 的产物做严格白名单只会带来误伤风险（用户
+/// 库里出现一种没预料到的对象就恢复不了备份），却不多挡任何攻击。
+///
+/// 越界动作是实测出来的，不是推断的：
+/// - `ATTACH DATABASE 'x'`、`VACUUM INTO 'x'`、裸 `VACUUM` **三者都**报
+///   `AuthAction::Attach`，所以拒 `Attach` 一条即可覆盖
+/// - 文件后端的虚拟表模块（`csvfile`、`zipfile` 等）能读写任意路径 → 拒 vtable
+/// - `Unknown` 是 rusqlite 对未识别动作码的兜底 → 未知即拒，将来 SQLite 新增的
+///   跨文件语句会默认落进这里，不依赖有人记得回来补名单
+fn import_authorizer(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
+    use rusqlite::hooks::{AuthAction, Authorization};
+
+    let escapes_temp_db = match context.action {
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => true,
+        AuthAction::CreateVtable { .. } | AuthAction::DropVtable { .. } => true,
+        AuthAction::Unknown { .. } => true,
+        AuthAction::Pragma { pragma_name, .. } => !IMPORT_ALLOWED_PRAGMAS
+            .iter()
+            .any(|allowed| pragma_name.eq_ignore_ascii_case(allowed)),
+        _ => false,
+    };
+
+    if escapes_temp_db {
+        // SQLite 只会回一句 "not authorized"，不记日志就无从知道是哪条语句被拦。
+        log::warn!("SQL 导入拒绝了越界语句: {:?}", context.action);
+        Authorization::Deny
+    } else {
+        Authorization::Allow
+    }
+}
+
+/// Tables whose data rows are skipped when exporting for WebDAV sync.
+const SYNC_SKIP_TABLES: &[&str] = &[
+    "proxy_request_logs",
+    "stream_check_logs",
+    "provider_health",
+    "proxy_live_backup",
+    "usage_daily_rollups",
+    "session_log_sync",
+    "session_usage_dedup",
+];
+
+/// Tables whose local data is preserved from the live database during WebDAV import.
+/// Excludes ephemeral tables like provider_health that can safely rebuild at runtime.
+const SYNC_PRESERVE_TABLES: &[&str] = &[
+    "proxy_request_logs",
+    "stream_check_logs",
+    "proxy_live_backup",
+    "usage_daily_rollups",
+    "session_log_sync",
+    "session_usage_dedup",
+];
+
+/// A database backup entry for the UI
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupEntry {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub created_at: String, // ISO 8601
+}
+
+impl Database {
+    /// 导出为 SQLite 兼容的 SQL 文本（内存字符串，完整导出）
+    pub fn export_sql_string(&self) -> Result<String, AppError> {
+        let snapshot = self.snapshot_to_memory()?;
+        Self::dump_sql(&snapshot, &[])
+    }
+
+    /// Export SQL for sync (WebDAV), skipping local-only tables' data
+    pub fn export_sql_string_for_sync(&self) -> Result<String, AppError> {
+        let snapshot = self.snapshot_to_memory()?;
+        Self::dump_sql(&snapshot, SYNC_SKIP_TABLES)
+    }
+
+    /// 导出为 SQLite 兼容的 SQL 文本
+    pub fn export_sql(&self, target_path: &Path) -> Result<(), AppError> {
+        let dump = self.export_sql_string()?;
+
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
+        }
+
+        crate::config::atomic_write(target_path, dump.as_bytes())
+    }
+
+    /// 从 SQL 文件导入，返回生成的备份 ID（若无备份则为空字符串）
+    pub fn import_sql(&self, source_path: &Path) -> Result<String, AppError> {
+        if !source_path.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "SQL 文件不存在: {}",
+                source_path.display()
+            )));
+        }
+
+        let sql_raw = fs::read_to_string(source_path).map_err(|e| AppError::io(source_path, e))?;
+        let sql_content = sql_raw.trim_start_matches('\u{feff}');
+        self.import_sql_string(sql_content)
+    }
+
+    /// 从 SQL 字符串导入，返回生成的备份 ID（若无备份则为空字符串）
+    pub fn import_sql_string(&self, sql_raw: &str) -> Result<String, AppError> {
+        self.import_sql_string_inner(sql_raw, &[])
+    }
+
+    /// Import SQL generated for sync, then restore local-only tables from the
+    /// current live database before replacing it.
+    pub(crate) fn import_sql_string_for_sync(&self, sql_raw: &str) -> Result<String, AppError> {
+        self.import_sql_string_inner(sql_raw, SYNC_PRESERVE_TABLES)
+    }
+
+    fn import_sql_string_inner(
+        &self,
+        sql_raw: &str,
+        preserve_tables: &[&str],
+    ) -> Result<String, AppError> {
+        self.import_sql_string_inner_with_hook(sql_raw, preserve_tables, || Ok(()))
+    }
+
+    fn import_sql_string_inner_with_hook<F>(
+        &self,
+        sql_raw: &str,
+        preserve_tables: &[&str],
+        on_staging_ready: F,
+    ) -> Result<String, AppError>
+    where
+        F: FnOnce() -> Result<(), AppError>,
+    {
+        let sql_content = sql_raw.trim_start_matches('\u{feff}');
+        Self::validate_cc_switch_sql_export(sql_content)?;
+
+        // 在临时数据库执行导入，确保失败不会污染主库
+        let temp_file = NamedTempFile::new().map_err(|e| AppError::IoContext {
+            context: "创建临时数据库文件失败".to_string(),
+            source: e,
+        })?;
+        let temp_path = temp_file.path().to_path_buf();
+        let temp_conn =
+            Connection::open(&temp_path).map_err(|e| AppError::Database(e.to_string()))?;
+        // SQLite Backup copies the source database header into the destination.
+        // Configure the empty staging database before creating any tables so a
+        // SQL import cannot downgrade the main DB from incremental vacuum to NONE.
+        temp_conn
+            .execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
+            .map_err(|e| AppError::Database(format!("设置暂存库 auto_vacuum 失败: {e}")))?;
+
+        // authorizer 只覆盖外部 SQL，执行完立刻摘掉：紧随其后的
+        // `create_tables_on_conn` / `apply_schema_migrations_on_conn` 是本程序自己的
+        // schema 维护语句，不属于需要设防的输入，没必要让它们也过一遍守卫。
+        temp_conn.authorizer(Some(import_authorizer));
+        let batch_result = temp_conn.execute_batch(sql_content);
+        temp_conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
+        batch_result.map_err(|e| AppError::Database(format!("执行 SQL 导入失败: {e}")))?;
+        if !temp_conn.is_autocommit() {
+            let _ = temp_conn.execute_batch("ROLLBACK;");
+            return Err(AppError::localized(
+                "backup.sql.incomplete_transaction",
+                "SQL 备份事务未完成，文件可能已截断。",
+                "The SQL backup transaction is incomplete; the file may be truncated.",
+            ));
+        }
+
+        // Validate the schema produced by the input itself before migrations
+        // can create missing tables and accidentally make a truncated file look valid.
+        Self::validate_imported_schema(&temp_conn)?;
+
+        // 补齐缺失表/索引并执行迁移
+        Self::create_tables_on_conn(&temp_conn)?;
+        Self::apply_schema_migrations_on_conn(&temp_conn)?;
+        on_staging_ready()?;
+
+        let backup_file_guard = lock_backup_file_operations()?;
+        // Keep one main-DB guard across the safety snapshot, local-table read,
+        // and final replacement so neither the rollback point nor preserved
+        // device-local rows can miss writes that arrived during staging.
+        let backup_path = {
+            let mut main_conn = lock_conn!(self.conn);
+            let backup_path =
+                Self::backup_database_file_from_conn(&backup_file_guard, &main_conn, &[])?;
+            if !preserve_tables.is_empty() {
+                Self::restore_tables(&main_conn, &temp_conn, preserve_tables)?;
+            }
+            let backup = Backup::new(&temp_conn, &mut main_conn)
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            Self::complete_backup(&backup, "替换主数据库")?;
+            backup_path
+        };
+
+        let backup_id = backup_path
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+
+        Ok(backup_id)
+    }
+
+    /// 创建内存快照以避免长时间持有数据库锁
+    pub(crate) fn snapshot_to_memory(&self) -> Result<Connection, AppError> {
+        let conn = lock_conn!(self.conn);
+        let mut snapshot =
+            Connection::open_in_memory().map_err(|e| AppError::Database(e.to_string()))?;
+
+        {
+            let backup =
+                Backup::new(&conn, &mut snapshot).map_err(|e| AppError::Database(e.to_string()))?;
+            Self::complete_backup(&backup, "创建内存数据库快照")?;
+        }
+
+        Ok(snapshot)
+    }
+
+    fn complete_backup(backup: &Backup<'_, '_>, context: &str) -> Result<(), AppError> {
+        let result = backup
+            .step(-1)
+            .map_err(|e| AppError::Database(format!("{context}失败: {e}")))?;
+        match result {
+            StepResult::Done => Ok(()),
+            StepResult::More | StepResult::Busy | StepResult::Locked => Err(AppError::Database(
+                format!("{context}未完成: SQLite Backup 返回 {result:?}"),
+            )),
+            _ => Err(AppError::Database(format!(
+                "{context}未完成: SQLite Backup 返回未知状态"
+            ))),
+        }
+    }
+
+    fn validate_cc_switch_sql_export(sql: &str) -> Result<(), AppError> {
+        let trimmed = sql.trim_start();
+        if trimmed.starts_with(CC_SWITCH_SQL_EXPORT_HEADER) {
+            return Ok(());
+        }
+
+        Err(AppError::localized(
+            "backup.sql.invalid_format",
+            "仅支持导入由 CC Switch 导出的 SQL 备份文件。",
+            "Only SQL backups exported by CC Switch are supported.",
+        ))
+    }
+
+    fn restore_tables(
+        source_conn: &Connection,
+        target_conn: &Connection,
+        tables: &[&str],
+    ) -> Result<(), AppError> {
+        // 整批复原放进一个事务：旧实现每行一条隐式自动提交的 INSERT，
+        // 目标是磁盘上的暂存库，等于每行一次 fsync——2.6 万行实测 119 秒。
+        // 合并成单事务后只剩最后一次提交；中途失败整体回滚，
+        // 也不会留下“半张表”的中间状态。
+        let tx = target_conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Database(format!("开启恢复事务失败: {e}")))?;
+
+        for table in tables {
+            if !Self::table_exists(source_conn, table)? || !Self::table_exists(&tx, table)? {
+                continue;
+            }
+
+            let columns = Self::get_table_columns(source_conn, table)?;
+            if columns.is_empty() {
+                continue;
+            }
+
+            let quoted_table = Self::quote_identifier(table);
+            let quoted_columns = columns
+                .iter()
+                .map(|column| Self::quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            tx.execute(&format!("DELETE FROM {quoted_table}"), [])
+                .map_err(|e| AppError::Database(format!("清空表 {table} 失败: {e}")))?;
+
+            let placeholders = (1..=columns.len())
+                .map(|idx| format!("?{idx}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert_sql =
+                format!("INSERT INTO {quoted_table} ({quoted_columns}) VALUES ({placeholders})");
+
+            // INSERT 语句每表只 prepare 一次，不再逐行重复解析。
+            let mut insert_stmt = tx
+                .prepare(&insert_sql)
+                .map_err(|e| AppError::Database(format!("准备表 {table} 插入语句失败: {e}")))?;
+
+            let mut stmt = source_conn
+                .prepare(&format!("SELECT {quoted_columns} FROM {quoted_table}"))
+                .map_err(|e| AppError::Database(format!("读取表 {table} 失败: {e}")))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| AppError::Database(format!("查询表 {table} 数据失败: {e}")))?;
+
+            while let Some(row) = rows.next().map_err(|e| AppError::Database(e.to_string()))? {
+                let mut values = Vec::with_capacity(columns.len());
+                for idx in 0..columns.len() {
+                    values.push(
+                        row.get::<_, rusqlite::types::Value>(idx)
+                            .map_err(|e| AppError::Database(e.to_string()))?,
+                    );
+                }
+
+                insert_stmt
+                    .execute(rusqlite::params_from_iter(values.iter()))
+                    .map_err(|e| AppError::Database(format!("恢复表 {table} 数据失败: {e}")))?;
+            }
+        }
+
+        Self::restore_sqlite_sequences(source_conn, &tx, tables)?;
+
+        tx.commit()
+            .map_err(|e| AppError::Database(format!("提交恢复事务失败: {e}")))?;
+        Ok(())
+    }
+
+    fn restore_sqlite_sequences(
+        source_conn: &Connection,
+        target_conn: &Connection,
+        tables: &[&str],
+    ) -> Result<(), AppError> {
+        if !Self::table_exists(source_conn, "sqlite_sequence")?
+            || !Self::table_exists(target_conn, "sqlite_sequence")?
+        {
+            return Ok(());
+        }
+
+        let mut source_stmt = source_conn
+            .prepare(
+                "SELECT seq FROM sqlite_sequence
+                 WHERE name = ?1 ORDER BY rowid DESC LIMIT 1",
+            )
+            .map_err(|e| AppError::Database(format!("读取 AUTOINCREMENT 序列失败: {e}")))?;
+        for table in tables {
+            target_conn
+                .execute("DELETE FROM sqlite_sequence WHERE name = ?1", [*table])
+                .map_err(|e| {
+                    AppError::Database(format!("清理表 {table} 的 AUTOINCREMENT 序列失败: {e}"))
+                })?;
+
+            let mut rows = source_stmt
+                .query([*table])
+                .map_err(|e| AppError::Database(format!("查询表 {table} 序列失败: {e}")))?;
+            if let Some(row) = rows.next().map_err(|e| AppError::Database(e.to_string()))? {
+                let sequence = row
+                    .get::<_, rusqlite::types::Value>(0)
+                    .map_err(|e| AppError::Database(format!("解析表 {table} 序列失败: {e}")))?;
+                target_conn
+                    .execute(
+                        "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                        rusqlite::params![table, sequence],
+                    )
+                    .map_err(|e| {
+                        AppError::Database(format!("恢复表 {table} 的 AUTOINCREMENT 序列失败: {e}"))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Periodic backup: create a new backup if the latest one is older than the configured interval
+    pub(crate) fn periodic_backup_if_needed(&self) -> Result<(), AppError> {
+        let interval_hours = crate::settings::effective_backup_interval_hours();
+        if interval_hours > 0 {
+            let backup_file_guard = lock_backup_file_operations()?;
+            let backup_dir = get_app_config_dir().join("backups");
+            if !backup_dir.exists() {
+                self.backup_database_file_locked(&backup_file_guard)?;
+            } else {
+                let latest = fs::read_dir(&backup_dir).ok().and_then(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().map(|ext| ext == "db").unwrap_or(false))
+                        .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
+                        .max()
+                });
+
+                let interval_secs = u64::from(interval_hours) * 3600;
+                let needs_backup = match latest {
+                    None => true,
+                    Some(last_modified) => {
+                        last_modified.elapsed().unwrap_or_default()
+                            > std::time::Duration::from_secs(interval_secs)
+                    }
+                };
+
+                if needs_backup {
+                    log::info!(
+                        "Periodic backup: latest backup is older than {interval_hours} hours, creating new backup"
+                    );
+                    self.backup_database_file_locked(&backup_file_guard)?;
+                }
+            }
+        }
+
+        // Periodic maintenance is always enabled, regardless of auto-backup settings.
+        let mut reclaimed_rows = 0u64;
+        match self.cleanup_old_stream_check_logs(7) {
+            Ok(deleted) => {
+                reclaimed_rows += deleted;
+            }
+            Err(e) => {
+                log::warn!("Periodic stream_check_logs cleanup failed: {e}");
+            }
+        }
+        match self.rollup_and_prune(30) {
+            Ok(deleted) => {
+                reclaimed_rows += deleted;
+            }
+            Err(e) => {
+                log::warn!("Periodic rollup_and_prune failed: {e}");
+            }
+        }
+        if reclaimed_rows > 0 {
+            let conn = lock_conn!(self.conn);
+            if let Err(e) = Self::incremental_vacuum_on_conn(&conn) {
+                log::warn!("Periodic incremental vacuum failed: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 生成一致性快照备份，返回备份文件路径（不存在主库时返回 None）
+    pub(crate) fn backup_database_file(&self) -> Result<Option<PathBuf>, AppError> {
+        let backup_file_guard = lock_backup_file_operations()?;
+        self.backup_database_file_locked(&backup_file_guard)
+    }
+
+    fn backup_database_file_locked(
+        &self,
+        backup_file_guard: &BackupFileOperationGuard,
+    ) -> Result<Option<PathBuf>, AppError> {
+        let conn = lock_conn!(self.conn);
+        Self::backup_database_file_from_conn(backup_file_guard, &conn, &[])
+    }
+
+    /// Create a safety backup from a connection whose caller already owns both
+    /// the backup-file operation guard and the appropriate database guard.
+    fn backup_database_file_from_conn(
+        backup_file_guard: &BackupFileOperationGuard,
+        source_conn: &Connection,
+        protected_paths: &[&Path],
+    ) -> Result<Option<PathBuf>, AppError> {
+        Self::backup_database_file_from_conn_with_hook(
+            backup_file_guard,
+            source_conn,
+            protected_paths,
+            |_, _| Ok(()),
+        )
+    }
+
+    fn backup_database_file_from_conn_with_hook<F>(
+        _backup_file_guard: &BackupFileOperationGuard,
+        source_conn: &Connection,
+        protected_paths: &[&Path],
+        before_publish: F,
+    ) -> Result<Option<PathBuf>, AppError>
+    where
+        F: FnOnce(&Path, &Path) -> Result<(), AppError>,
+    {
+        let db_path = get_app_config_dir().join("aimyria-one.db");
+        if !db_path.exists() {
+            return Ok(None);
+        }
+
+        let backup_dir = db_path
+            .parent()
+            .ok_or_else(|| AppError::Config("无效的数据库路径".to_string()))?
+            .join("backups");
+
+        fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+
+        let base_id = format!("db_backup_{}", Local::now().format("%Y%m%d_%H%M%S"));
+        let mut next_suffix = 0;
+        let mut backup_path =
+            Self::next_available_backup_path(&backup_dir, &base_id, &mut next_suffix);
+
+        // Build and validate the backup under a non-.db temporary name. Backup
+        // discovery and retention only see the final path after the complete
+        // SQLite image has been atomically published.
+        let mut temp_path = Builder::new()
+            .prefix(".aimyria-backup-")
+            .suffix(".tmp")
+            .tempfile_in(&backup_dir)
+            .map_err(|e| AppError::io(&backup_dir, e))?
+            .into_temp_path();
+        let temp_db_path: &Path = temp_path.as_ref();
+        let mut dest_conn =
+            Connection::open(temp_db_path).map_err(|e| AppError::Database(e.to_string()))?;
+        let backup = Backup::new(source_conn, &mut dest_conn)
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Self::complete_backup(&backup, "创建数据库安全备份")?;
+        drop(backup);
+        Self::validate_sqlite_integrity(&dest_conn)?;
+        dest_conn
+            .close()
+            .map_err(|(_, e)| AppError::Database(format!("关闭数据库安全备份失败: {e}")))?;
+        before_publish(temp_db_path, &backup_path)?;
+
+        loop {
+            match temp_path.persist_noclobber(&backup_path) {
+                Ok(()) => break,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    temp_path = error.path;
+                    backup_path =
+                        Self::next_available_backup_path(&backup_dir, &base_id, &mut next_suffix);
+                }
+                Err(error) => return Err(AppError::io(&backup_path, error.error)),
+            }
+        }
+
+        // The newly created safety backup must never be the cleanup victim.
+        // During restore, the selected source is protected as well. If the
+        // configured retention is too small to keep both, temporarily exceed
+        // it instead of deleting either side of the recovery operation.
+        let mut cleanup_protected = Vec::with_capacity(protected_paths.len() + 1);
+        cleanup_protected.push(backup_path.as_path());
+        cleanup_protected.extend_from_slice(protected_paths);
+        Self::cleanup_db_backups(&backup_dir, &cleanup_protected)?;
+        Ok(Some(backup_path))
+    }
+
+    fn next_available_backup_path(
+        backup_dir: &Path,
+        base_id: &str,
+        next_suffix: &mut usize,
+    ) -> PathBuf {
+        loop {
+            let backup_id = if *next_suffix == 0 {
+                base_id.to_string()
+            } else {
+                format!("{base_id}_{}", *next_suffix)
+            };
+            *next_suffix += 1;
+            let backup_path = backup_dir.join(format!("{backup_id}.db"));
+            if !backup_path.exists() {
+                return backup_path;
+            }
+        }
+    }
+
+    fn same_existing_backup_path(left: &Path, right: &Path) -> bool {
+        match (fs::canonicalize(left), fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left == right,
+        }
+    }
+
+    /// 清理旧的数据库备份，保留最新的 N 个
+    fn cleanup_db_backups(dir: &Path, protected_paths: &[&Path]) -> Result<(), AppError> {
+        let retain = crate::settings::effective_backup_retain_count();
+        let entries = match fs::read_dir(dir) {
+            Ok(iter) => iter
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .map(|ext| ext == "db")
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => return Ok(()),
+        };
+
+        if entries.len() <= retain {
+            return Ok(());
+        }
+
+        let remove_count = entries.len().saturating_sub(retain);
+        let mut sorted = entries;
+        sorted.sort_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());
+
+        let mut removed = 0;
+        for entry in sorted {
+            if removed >= remove_count {
+                break;
+            }
+            let path = entry.path();
+            if protected_paths
+                .iter()
+                .any(|protected| Self::same_existing_backup_path(&path, protected))
+            {
+                continue;
+            }
+
+            if let Err(err) = fs::remove_file(&path) {
+                log::warn!("删除旧数据库备份失败 {}: {}", path.display(), err);
+            } else {
+                removed += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_sqlite_integrity(conn: &Connection) -> Result<(), AppError> {
+        let mut stmt = conn
+            .prepare("PRAGMA quick_check;")
+            .map_err(|e| AppError::Database(format!("检查数据库完整性失败: {e}")))?;
+        let results = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Database(format!("检查数据库完整性失败: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Database(format!("检查数据库完整性失败: {e}")))?;
+
+        if results.len() == 1 && results[0].eq_ignore_ascii_case("ok") {
+            return Ok(());
+        }
+
+        Err(AppError::localized(
+            "backup.db.integrity_failed",
+            format!("数据库备份完整性检查失败: {}", results.join("; ")),
+            format!(
+                "Database backup integrity check failed: {}",
+                results.join("; ")
+            ),
+        ))
+    }
+
+    /// Validate that the external SQL created a recognizable CC Switch schema.
+    ///
+    /// These tables all existed in the oldest supported SQL-export schema
+    /// (v3.8.x). Checking before migrations keeps header-only/truncated files
+    /// from being completed by `create_tables_on_conn`, while allowing a valid
+    /// backup whose user-owned configuration tables happen to contain no rows.
+    fn validate_imported_schema(conn: &Connection) -> Result<(), AppError> {
+        const REQUIRED_TABLES: &[&str] = &[
+            "providers",
+            "provider_endpoints",
+            "mcp_servers",
+            "prompts",
+            "skills",
+            "skill_repos",
+            "settings",
+        ];
+
+        let mut missing = Vec::new();
+        for table in REQUIRED_TABLES {
+            if !Self::table_exists(conn, table)? {
+                missing.push(*table);
+            }
+        }
+        if !missing.is_empty() {
+            let names = missing.join(", ");
+            return Err(AppError::localized(
+                "backup.sql.invalid_schema",
+                format!("导入的 SQL 缺少 CC Switch 必需表：{names}"),
+                format!("The imported SQL is missing required CC Switch tables: {names}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 导出数据库为 SQL 文本
+    fn dump_sql(conn: &Connection, skip_tables: &[&str]) -> Result<String, AppError> {
+        let mut output = String::new();
+        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        output.push_str(&format!(
+            "-- CC Switch SQLite 导出\n-- 生成时间: {timestamp}\n-- user_version: {user_version}\n"
+        ));
+        output.push_str("PRAGMA foreign_keys=OFF;\n");
+        output.push_str(&format!("PRAGMA user_version={user_version};\n"));
+        output.push_str("BEGIN TRANSACTION;\n");
+
+        // 导出 schema
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, tbl_name, sql
+                 FROM sqlite_master
+                 WHERE sql NOT NULL AND type IN ('table','index','trigger','view')
+                 ORDER BY type='table' DESC, name",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut tables = Vec::new();
+        let mut triggers = Vec::new();
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        while let Some(row) = rows.next().map_err(|e| AppError::Database(e.to_string()))? {
+            let obj_type: String = row.get(0).map_err(|e| AppError::Database(e.to_string()))?;
+            let name: String = row.get(1).map_err(|e| AppError::Database(e.to_string()))?;
+            let sql: String = row.get(3).map_err(|e| AppError::Database(e.to_string()))?;
+
+            // 跳过 SQLite 内部对象（如 sqlite_sequence）
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+
+            if obj_type == "trigger" {
+                triggers.push(sql);
+                continue;
+            }
+
+            output.push_str(&sql);
+            output.push_str(";\n");
+            if obj_type == "table" {
+                tables.push(name);
+            }
+        }
+
+        // 导出数据
+        for table in tables {
+            if skip_tables.iter().any(|t| *t == table) {
+                continue;
+            }
+            let columns = Self::get_table_columns(conn, &table)?;
+            if columns.is_empty() {
+                continue;
+            }
+
+            // 每行一条 INSERT 是导入慢的根源：恢复侧要为每条语句单独
+            // 解析/准备/收尾，2 万行实测 21 秒（内存库上一样慢，说明是
+            // 纯 CPU 而非 I/O）。合并成多行 VALUES 后同样数据 <100ms。
+            // SQLite 从 3.7.11（2012）起支持多行 VALUES，且导入侧是通用
+            // execute_batch，新旧两种格式都能读——向后兼容无忧。
+            let quoted_table = Self::quote_identifier(&table);
+            let quoted_columns = columns
+                .iter()
+                .map(|column| Self::quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert_prefix = format!("INSERT INTO {quoted_table} ({quoted_columns}) VALUES ");
+
+            let mut stmt = conn
+                .prepare(&format!("SELECT {quoted_columns} FROM {quoted_table}"))
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+            let mut pending_rows = 0usize;
+            let mut batch = String::new();
+            while let Some(row) = rows.next().map_err(|e| AppError::Database(e.to_string()))? {
+                let mut values = Vec::with_capacity(columns.len());
+                for idx in 0..columns.len() {
+                    let value = row
+                        .get_ref(idx)
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    values.push(Self::format_sql_value(value)?);
+                }
+
+                let row_sql = format!("({})", values.join(", "));
+                let separator_bytes = usize::from(pending_rows > 0);
+                if pending_rows > 0
+                    && batch.len() + separator_bytes + row_sql.len() + 2 > INSERT_BATCH_MAX_BYTES
+                {
+                    batch.push_str(";\n");
+                    output.push_str(&batch);
+                    pending_rows = 0;
+                }
+
+                if pending_rows == 0 {
+                    batch.clear();
+                    batch.push_str(&insert_prefix);
+                } else {
+                    batch.push(',');
+                }
+                batch.push_str(&row_sql);
+                pending_rows += 1;
+
+                if pending_rows >= INSERT_BATCH_MAX_ROWS {
+                    batch.push_str(";\n");
+                    output.push_str(&batch);
+                    pending_rows = 0;
+                }
+            }
+            if pending_rows > 0 {
+                batch.push_str(";\n");
+                output.push_str(&batch);
+            }
+        }
+
+        Self::dump_sqlite_sequences(conn, skip_tables, &mut output)?;
+
+        // Triggers must be created after loading table data so they cannot
+        // change dump rows or abandon the remainder of a multi-row INSERT.
+        for sql in triggers {
+            output.push_str(&sql);
+            output.push_str(";\n");
+        }
+
+        output.push_str("COMMIT;\nPRAGMA foreign_keys=ON;\n");
+        Ok(output)
+    }
+
+    fn dump_sqlite_sequences(
+        conn: &Connection,
+        skip_tables: &[&str],
+        output: &mut String,
+    ) -> Result<(), AppError> {
+        if !Self::table_exists(conn, "sqlite_sequence")? {
+            return Ok(());
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+            .map_err(|e| AppError::Database(format!("读取 AUTOINCREMENT 序列失败: {e}")))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| AppError::Database(format!("查询 AUTOINCREMENT 序列失败: {e}")))?;
+        let mut values = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| AppError::Database(e.to_string()))? {
+            let table: String = row
+                .get(0)
+                .map_err(|e| AppError::Database(format!("解析 AUTOINCREMENT 表名失败: {e}")))?;
+            if skip_tables.iter().any(|skipped| *skipped == table) {
+                continue;
+            }
+            let sequence = row
+                .get_ref(1)
+                .map_err(|e| AppError::Database(format!("解析表 {table} 序列失败: {e}")))?;
+            values.push(format!(
+                "({}, {})",
+                Self::format_sql_value(ValueRef::Text(table.as_bytes()))?,
+                Self::format_sql_value(sequence)?
+            ));
+        }
+
+        // Data INSERTs update sqlite_sequence to MAX(rowid), which loses a
+        // deleted high-water mark. Replace those derived values with the exact
+        // source metadata after all user-table rows have been loaded.
+        output.push_str("DELETE FROM sqlite_sequence;\n");
+        if !values.is_empty() {
+            output.push_str("INSERT INTO sqlite_sequence (name, seq) VALUES ");
+            output.push_str(&values.join(","));
+            output.push_str(";\n");
+        }
+        Ok(())
+    }
+
+    fn quote_identifier(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
+
+    /// 获取表的列名列表
+    fn get_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, AppError> {
+        let quoted_table = Self::quote_identifier(table);
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({quoted_table})"))
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let iter = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut columns = Vec::new();
+        for col in iter {
+            columns.push(col.map_err(|e| AppError::Database(e.to_string()))?);
+        }
+        Ok(columns)
+    }
+
+    /// 格式化 SQL 值
+    fn format_sql_value(value: ValueRef<'_>) -> Result<String, AppError> {
+        match value {
+            ValueRef::Null => Ok("NULL".to_string()),
+            ValueRef::Integer(i) => Ok(i.to_string()),
+            ValueRef::Real(f) => Ok(Self::format_sql_real(f)),
+            ValueRef::Text(t) => match std::str::from_utf8(t) {
+                // SQLite's SQL parser treats NUL as the end of the statement.
+                // Keep readable literals for normal UTF-8, and use a hex cast
+                // whenever a TEXT value cannot safely appear in SQL source.
+                Ok(text) if !text.contains('\0') => {
+                    let escaped = text.replace('\'', "''");
+                    Ok(format!("'{escaped}'"))
+                }
+                _ => Ok(format!("CAST({} AS TEXT)", Self::format_sql_blob(t))),
+            },
+            ValueRef::Blob(bytes) => Ok(Self::format_sql_blob(bytes)),
+        }
+    }
+
+    fn format_sql_real(value: f64) -> String {
+        if value.is_nan() {
+            // SQLite normalizes bound NaN values to NULL as well.
+            return "NULL".to_string();
+        }
+        if value.is_infinite() {
+            return if value.is_sign_negative() {
+                "-9.0e999".to_string()
+            } else {
+                "9.0e999".to_string()
+            };
+        }
+        if value == 0.0 && value.is_sign_negative() {
+            return "-0.0".to_string();
+        }
+
+        let mut literal = value.to_string();
+        if !literal.contains(['.', 'e', 'E']) {
+            // Without a decimal point/exponent SQLite stores integer-valued
+            // REALs as INTEGER in columns without REAL affinity (e.g. STRICT ANY).
+            literal.push_str(".0");
+        }
+        literal
+    }
+
+    fn format_sql_blob(bytes: &[u8]) -> String {
+        let mut s = String::from("X'");
+        for b in bytes {
+            use std::fmt::Write;
+            let _ = write!(&mut s, "{b:02X}");
+        }
+        s.push('\'');
+        s
+    }
+
+    /// List all database backup files, sorted by creation time (newest first)
+    pub fn list_backups() -> Result<Vec<BackupEntry>, AppError> {
+        let _backup_file_guard = lock_backup_file_operations()?;
+        let backup_dir = get_app_config_dir().join("backups");
+        if !backup_dir.exists() {
+            return Ok(vec![]);
+        }
+
+        let mut entries: Vec<BackupEntry> = fs::read_dir(&backup_dir)
+            .map_err(|e| AppError::io(&backup_dir, e))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|ext| ext == "db").unwrap_or(false))
+            .filter_map(|e| {
+                let metadata = e.metadata().ok()?;
+                let filename = e.file_name().to_string_lossy().to_string();
+                let size_bytes = metadata.len();
+                let created_at = metadata
+                    .modified()
+                    .ok()
+                    .map(|t| {
+                        let dt: chrono::DateTime<Utc> = t.into();
+                        dt.to_rfc3339()
+                    })
+                    .unwrap_or_default();
+                Some(BackupEntry {
+                    filename,
+                    size_bytes,
+                    created_at,
+                })
+            })
+            .collect();
+
+        // Sort by created_at descending (newest first)
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(entries)
+    }
+
+    /// Restore database from a backup file. Returns the safety backup ID.
+    pub fn restore_from_backup(&self, filename: &str) -> Result<String, AppError> {
+        self.restore_from_backup_with_hook(filename, |_| Ok(()))
+    }
+
+    fn restore_from_backup_with_hook<F>(
+        &self,
+        filename: &str,
+        before_replace: F,
+    ) -> Result<String, AppError>
+    where
+        F: FnOnce(Option<&Path>) -> Result<(), AppError>,
+    {
+        // Security: validate filename to prevent path traversal
+        if filename.contains("..")
+            || filename.contains('/')
+            || filename.contains('\\')
+            || !filename.ends_with(".db")
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid backup filename".to_string(),
+            ));
+        }
+
+        let backup_file_guard = lock_backup_file_operations()?;
+        let backup_dir = get_app_config_dir().join("backups");
+        let backup_path = backup_dir.join(filename);
+
+        if !backup_path.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "Backup file not found: {filename}"
+            )));
+        }
+
+        // Open read-only before creating the safety backup. `Connection::open`
+        // would recreate a source removed by retention cleanup as an empty DB.
+        let source_conn = Connection::open_with_flags(
+            &backup_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Stage and fully validate the selected file before touching the live
+        // connection. A corrupt/future-schema backup or failed migration must
+        // leave the current database unchanged.
+        let temp_file = NamedTempFile::new().map_err(|e| AppError::IoContext {
+            context: "创建数据库恢复暂存文件失败".to_string(),
+            source: e,
+        })?;
+        let mut staging_conn =
+            Connection::open(temp_file.path()).map_err(|e| AppError::Database(e.to_string()))?;
+        {
+            let backup = Backup::new(&source_conn, &mut staging_conn)
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            Self::complete_backup(&backup, "读取数据库备份")?;
+        }
+        drop(source_conn);
+
+        Self::validate_sqlite_integrity(&staging_conn)?;
+        Self::validate_imported_schema(&staging_conn)?;
+        Self::ensure_incremental_auto_vacuum_on_conn(&staging_conn)?;
+        Self::create_tables_on_conn(&staging_conn)?;
+        Self::apply_schema_migrations_on_conn(&staging_conn)?;
+        Self::ensure_model_pricing_seeded_on_conn(&staging_conn)?;
+        Self::validate_sqlite_integrity(&staging_conn)?;
+
+        // Keep one main-DB guard across the safety snapshot and final apply so
+        // the safety file exactly represents the state being replaced.
+        let safety_backup = {
+            let mut main_conn = lock_conn!(self.conn);
+            let safety_backup = Self::backup_database_file_from_conn(
+                &backup_file_guard,
+                &main_conn,
+                &[backup_path.as_path()],
+            )?;
+            before_replace(safety_backup.as_deref())?;
+            let backup = Backup::new(&staging_conn, &mut main_conn)
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            Self::complete_backup(&backup, "恢复主数据库")?;
+            safety_backup
+        };
+        let safety_id = safety_backup
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+
+        log::info!("Database restored from backup: {filename}, safety backup: {safety_id}");
+        Ok(safety_id)
+    }
+
+    /// Rename a backup file. Returns the new filename.
+    pub fn rename_backup(old_filename: &str, new_name: &str) -> Result<String, AppError> {
+        // Validate old filename (path traversal + .db suffix)
+        if old_filename.contains("..")
+            || old_filename.contains('/')
+            || old_filename.contains('\\')
+            || !old_filename.ends_with(".db")
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid backup filename".to_string(),
+            ));
+        }
+
+        // Clean new name
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::InvalidInput(
+                "New name cannot be empty".to_string(),
+            ));
+        }
+
+        // Length limit (without .db suffix)
+        let name_part = trimmed.strip_suffix(".db").unwrap_or(trimmed);
+        if name_part.len() > 100 {
+            return Err(AppError::InvalidInput(
+                "Name too long (max 100 characters)".to_string(),
+            ));
+        }
+
+        // Prevent path traversal in new name
+        if name_part.contains("..")
+            || name_part.contains('/')
+            || name_part.contains('\\')
+            || name_part.contains('\0')
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid characters in new name".to_string(),
+            ));
+        }
+
+        let new_filename = format!("{name_part}.db");
+
+        let _backup_file_guard = lock_backup_file_operations()?;
+        let backup_dir = get_app_config_dir().join("backups");
+        let old_path = backup_dir.join(old_filename);
+        let new_path = backup_dir.join(&new_filename);
+
+        if !old_path.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "Backup file not found: {old_filename}"
+            )));
+        }
+
+        if new_path.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "A backup named '{new_filename}' already exists"
+            )));
+        }
+
+        fs::rename(&old_path, &new_path).map_err(|e| AppError::io(&old_path, e))?;
+        log::info!("Renamed backup: {old_filename} -> {new_filename}");
+        Ok(new_filename)
+    }
+
+    /// Delete a backup file permanently.
+    pub fn delete_backup(filename: &str) -> Result<(), AppError> {
+        // Validate filename (path traversal + .db suffix)
+        if filename.contains("..")
+            || filename.contains('/')
+            || filename.contains('\\')
+            || !filename.ends_with(".db")
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid backup filename".to_string(),
+            ));
+        }
+
+        let _backup_file_guard = lock_backup_file_operations()?;
+        let backup_path = get_app_config_dir().join("backups").join(filename);
+        if !backup_path.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "Backup file not found: {filename}"
+            )));
+        }
+
+        fs::remove_file(&backup_path).map_err(|e| AppError::io(&backup_path, e))?;
+        log::info!("Deleted backup: {filename}");
+        Ok(())
+    }
+}

@@ -1,0 +1,177 @@
+[package]
+name = "aimyria-one"
+# Version discipline -- read this before changing the number.
+#
+# THREE files must change together, and this is one of them:
+#
+#   1. src-tauri/Cargo.toml      <- `env!("CARGO_PKG_VERSION")`, what the
+#                                   self-updater compares against and what the
+#                                   startup log line prints
+#   2. src-tauri/tauri.conf.json <- what the bundle and the UI report
+#   3. package.json              <- what the JS side reports
+#
+# Changing only one leaves the others behind and the consequences are silent: if
+# Cargo.toml is not bumped, `updater.rs` keeps comparing the manifest to the old
+# number and reports "already up to date" forever -- the exact failure this
+# version bump exists to escape. `scripts/check_version_sync.ps1` checks all
+# three.
+version = "1.0.1"
+description = "AimyriA go - one-click configuration tool for AI coding CLIs"
+# Upstream author must be retained per MIT license.
+# Original: https://github.com/farion1231/cc-switch  (Copyright (c) 2025 Jason Young)
+authors = ["Jason Young (original author)", "Aimyria"]
+license = "MIT"
+repository = "https://github.com/aimyria/aimyria-one"
+edition = "2021"
+rust-version = "1.85.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "aimyria_one_lib"
+# `cdylib` and `staticlib` are for mobile, where the Rust code is loaded by a
+# native host. Desktop-only: we ship an exe, so they were pure cost — and
+# `cdylib` actively broke the build, because it exports every Rust symbol as a
+# DLL export and 500+ dependencies put the ordinal count over the 65,535 limit
+# ("export ordinal too large: 87346").
+crate-type = ["rlib"]
+doctest = false
+
+# The standalone logic harness lives outside src/ because it does not exercise
+# the crate — it re-runs copies of the pure functions. It is a separate target
+# so that `cargo test --test verify_logic` resolves its dependencies the way the
+# rest of the build does.
+#
+# Handing `rustc` a `--extern serde_json=<rlib>` path was the alternative, and it
+# is wrong: the deps directory accumulates one rlib per rebuild, each with a
+# different content hash, and picking "the newest" links against a serde_json
+# that the harness was not compiled for. The resulting link failure names four
+# transitive rlibs and nothing else.
+#
+# Being a separate target also means it never links WebView2Loader, so it runs
+# on machines where `cargo test --lib` cannot be loaded.
+[[test]]
+name = "verify_logic"
+path = "../tools/verify_logic.rs"
+harness = true
+
+[features]
+# `custom-protocol` is what makes the build embed `frontendDist` into the binary
+# and serve the UI over Tauri's own protocol instead of navigating to `devUrl`.
+#
+# Without it the app still compiles, still launches, still registers deep links,
+# still writes client configs — every backend behaviour is correct — and the
+# window shows "localhost 拒绝连接 / ERR_CONNECTION_REFUSED". A release binary
+# with no UI in it at all.
+#
+# `tauri dev` turns this off explicitly, so the dev server keeps working.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+test-hooks = []
+
+[build-dependencies]
+tauri-build = { version = "2.4.0", features = [] }
+
+[dependencies]
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+tauri = { version = "2.8.2", features = ["tray-icon", "image-png"] }
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-store = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-window-state = "2"
+dirs = "5.0"
+toml = "0.8"
+toml_edit = "0.22"
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream", "socks"] }
+arboard = "3.6"
+flate2 = "1"
+brotli = "7"
+zstd = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+futures = "0.3"
+async-stream = "0.3"
+bytes = "1.5"
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "client-legacy"] }
+hyper-rustls = { version = "0.27", features = ["http1", "tls12", "ring", "webpki-tokio"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+httparse = "1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"
+regex = "1.10"
+rquickjs = { version = "0.8", features = ["array-buffer", "classes"] }
+thiserror = "2.0"
+anyhow = "1.0"
+zip = "2.2"
+serde_yaml = "0.9"
+tempfile = "3"
+url = "2.5"
+auto-launch = "0.5"
+once_cell = "1.21.3"
+base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled", "backup", "hooks"] }
+indexmap = { version = "2", features = ["serde"] }
+rust_decimal = "1.33"
+uuid = { version = "1.11", features = ["v4"] }
+sha2 = "0.10"
+hmac = "0.12"
+json5 = "0.4"
+json-five = "0.3.1"
+sys-locale = "0.3"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0.1", features = ["v2_16"] }
+gtk = "0.18"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
+rquickjs = { version = "0.8", features = ["bindgen"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSColor"] }
+
+# Optimize release binary size to help reduce AppImage footprint
+[profile.release]
+# 主 crate 体量大，codegen-units = 1 时 LLVM 只能单线程跑，发布编译的大头都在它身上。
+# 16 让主 crate 编译快约 64%，代价是二进制体积增加约 17%（10-05 本机基准）。
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+# 使用 unwind 以便 panic hook 能捕获 backtrace（abort 会直接终止无法捕获）
+panic = "unwind"
+strip = "symbols"
+
+[dev-dependencies]
+serial_test = "3"
+tempfile = "3"

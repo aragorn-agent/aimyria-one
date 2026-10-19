@@ -1,0 +1,238 @@
+# 命令面差集
+
+- 前端 invoke 了 **319** 个命令
+- 后端用 #[tauri::command] 定义了 **227** 个
+- invoke_handler 注册了 **114** 个条目
+
+## 前端调用但后端没定义（运行时会报 Command not found）
+
+- `acknowledge_codex_stale_clients`  ← lib/api/proxy.ts
+- `add_to_failover_queue`  ← lib/api/failover.ts
+- `adopt_codex_stack_catalog`  ← lib/api/proxy.ts
+- `apply_profile`  ← lib/api/profiles.ts
+- `auth_cancel_login`  ← lib/api/auth.ts
+- `auth_get_status`  ← lib/api/auth.ts
+- `auth_list_accounts`  ← lib/api/auth.ts
+- `auth_logout`  ← lib/api/auth.ts
+- `auth_poll_for_account`  ← lib/api/auth.ts
+- `auth_remove_account`  ← lib/api/auth.ts
+- `auth_set_default_account`  ← lib/api/auth.ts
+- `auth_start_login`  ← lib/api/auth.ts
+- `clear_current_profile`  ← lib/api/profiles.ts
+- `codex_forces_multi_agent_v2`  ← lib/api/settings.ts
+- `copilot_get_auth_status`  ← lib/api/copilot.ts
+- `copilot_get_models`  ← lib/api/copilot.ts
+- `copilot_get_models_for_account`  ← lib/api/copilot.ts
+- `copilot_get_token`  ← lib/api/copilot.ts
+- `copilot_get_token_for_account`  ← lib/api/copilot.ts
+- `copilot_get_usage`  ← lib/api/copilot.ts
+- `copilot_get_usage_for_account`  ← lib/api/copilot.ts
+- `copilot_is_authenticated`  ← lib/api/copilot.ts
+- `copilot_list_accounts`  ← lib/api/copilot.ts
+- `copilot_logout`  ← lib/api/copilot.ts
+- `copilot_poll_for_account`  ← lib/api/copilot.ts
+- `copilot_poll_for_auth`  ← lib/api/copilot.ts
+- `copilot_remove_account`  ← lib/api/copilot.ts
+- `copilot_set_default_account`  ← lib/api/copilot.ts
+- `copilot_start_device_flow`  ← lib/api/copilot.ts
+- `create_profile`  ← lib/api/profiles.ts
+- `delete_profile`  ← lib/api/profiles.ts
+- `delete_universal_provider`  ← lib/api/providers.ts
+- `ensure_claude_desktop_official_provider`  ← lib/api/providers.ts
+- `exit_proxy_apps_in_mode`  ← lib/api/proxy.ts
+- `get_app_mode`  ← lib/api/proxy.ts
+- `get_auto_failover_enabled`  ← lib/api/failover.ts
+- `get_available_providers_for_failover`  ← lib/api/failover.ts
+- `get_circuit_breaker_config`  ← lib/api/failover.ts
+- `get_circuit_breaker_stats`  ← lib/api/failover.ts
+- `get_claude_desktop_default_routes`  ← lib/api/providers.ts
+- `get_claude_desktop_status`  ← lib/api/providers.ts
+- `get_codex_oauth_models`  ← lib/api/model-fetch.ts
+- `get_codex_oauth_quota`  ← lib/api/subscription.ts
+- `get_codex_session_compression`  ← lib/api/settings.ts
+- `get_codex_sessions_disk_usage`  ← lib/api/settings.ts
+- `get_direct_provider`  ← lib/api/proxy.ts
+- `get_failover_queue`  ← lib/api/failover.ts
+- `get_global_proxy_config`  ← lib/api/proxy.ts
+- `get_global_proxy_url`  ← lib/api/globalProxy.ts
+- `get_log_config`  ← lib/api/settings.ts
+- `get_mcp_config`  ← lib/api/mcp.ts
+- `get_opencode_live_provider_ids`  ← lib/api/providers.ts
+- `get_optimizer_config`  ← lib/api/settings.ts
+- `get_pricing_model_source`  ← lib/api/proxy.ts
+- `get_provider_health`  ← lib/api/failover.ts
+- `get_proxy_client_host`  ← lib/api/proxy.ts
+- `get_proxy_config_for_app`  ← lib/api/proxy.ts
+- `get_proxy_stack`  ← lib/api/proxy.ts
+- `get_proxy_status`  ← lib/api/proxy.ts
+- `get_proxy_takeover_status`  ← lib/api/proxy.ts
+- `get_rectifier_config`  ← lib/api/settings.ts
+- `get_skills_migration_result`  ← App.tsx
+- `get_tool_versions`  ← lib/api/settings.ts
+- `get_universal_provider`  ← lib/api/providers.ts
+- `get_universal_providers`  ← lib/api/providers.ts
+- `get_upstream_proxy_status`  ← lib/api/globalProxy.ts
+- `get_xai_oauth_models`  ← lib/api/model-fetch.ts
+- `get_xai_oauth_quota`  ← lib/api/subscription.ts
+- `import_claude_desktop_providers_from_claude`  ← lib/api/providers.ts
+- `import_opencode_providers_from_live`  ← lib/api/providers.ts
+- `launch_hermes_dashboard`  ← lib/api/hermes.ts
+- `list_profiles`  ← lib/api/profiles.ts
+- `list_tool_installations`  ← lib/api/settings.ts
+- `open_provider_terminal`  ← lib/api/providers.ts
+- `probe_tool_installations`  ← lib/api/settings.ts
+- `remove_from_failover_queue`  ← lib/api/failover.ts
+- `reset_circuit_breaker`  ← lib/api/failover.ts
+- `restart_codex_app_server_daemon`  ← lib/api/proxy.ts
+- `restore_codex_unified_history`  ← lib/api/settings.ts
+- `run_tool_lifecycle_action`  ← lib/api/settings.ts
+- `scan_local_proxies`  ← lib/api/globalProxy.ts
+- `set_auto_failover_enabled`  ← lib/api/failover.ts
+- `set_codex_session_compression`  ← lib/api/settings.ts
+- `set_global_proxy_url`  ← lib/api/globalProxy.ts
+- `set_log_config`  ← lib/api/settings.ts
+- `set_mcp_enabled`  ← lib/api/mcp.ts
+- `set_optimizer_config`  ← lib/api/settings.ts
+- `set_pricing_model_source`  ← lib/api/proxy.ts
+- `set_proxy_client_host`  ← lib/api/proxy.ts
+- `set_proxy_route`  ← lib/api/proxy.ts
+- `set_proxy_stack_member`  ← lib/api/proxy.ts
+- `set_proxy_takeover_for_app`  ← lib/api/proxy.ts
+- `set_rectifier_config`  ← lib/api/settings.ts
+- `start_proxy_server`  ← lib/api/proxy.ts
+- `stop_proxy_server`  ← lib/api/proxy.ts
+- `stop_proxy_with_restore`  ← lib/api/proxy.ts
+- `sync_universal_provider`  ← lib/api/providers.ts
+- `take_startup_attach_failures`  ← lib/api/proxy.ts
+- `test_proxy_url`  ← lib/api/globalProxy.ts
+- `tray_app_page_seen`  ← hooks/useTrayNavigation.ts
+- `update_circuit_breaker_config`  ← lib/api/failover.ts
+- `update_global_proxy_config`  ← lib/api/proxy.ts
+- `update_pi_provider_usage_script`  ← lib/api/pi.ts
+- `update_profile`  ← lib/api/profiles.ts
+- `update_proxy_config_for_app`  ← lib/api/proxy.ts
+- `upsert_universal_provider`  ← lib/api/providers.ts
+
+## 后端定义了但没注册（存在但调不到 —— 本项目已踩过两次）
+
+- `apply_claude_onboarding_skip`
+- `apply_claude_plugin_config`
+- `check_env_conflicts`
+- `clear_claude_onboarding_skip`
+- `create_db_backup`
+- `delete_backup_location`
+- `delete_daily_memory_file`
+- `delete_db_backup`
+- `delete_env_vars`
+- `delete_model_pricing`
+- `delete_session`
+- `delete_sessions`
+- `disable_current_omo`
+- `disable_current_omo_slim`
+- `export_config_to_file`
+- `export_session_markdown`
+- `get_app_config_path`
+- `get_auto_launch_status`
+- `get_balance`
+- `get_claude_code_config_path`
+- `get_coding_plan_quota`
+- `get_config_dir`
+- `get_current_omo_provider_id`
+- `get_current_omo_slim_provider_id`
+- `get_hermes_live_provider_ids`
+- `get_hermes_memory`
+- `get_hermes_memory_limits`
+- `get_hermes_model_config`
+- `get_models_dev_sync_config`
+- `get_openclaw_agents_defaults`
+- `get_openclaw_default_model`
+- `get_openclaw_env`
+- `get_openclaw_live_provider`
+- `get_openclaw_live_provider_ids`
+- `get_openclaw_model_catalog`
+- `get_openclaw_tools`
+- `get_pi_current_state`
+- `get_pi_session_discovery`
+- `get_session_block_content`
+- `get_session_image`
+- `get_session_messages`
+- `get_session_usage_last_sync`
+- `get_subscription_quota`
+- `get_usage_data_sources`
+- `import_config_from_file`
+- `import_hermes_providers_from_live`
+- `import_openclaw_providers_from_live`
+- `launch_session_terminal`
+- `list_backup_locations`
+- `list_daily_memory_files`
+- `list_db_backups`
+- `list_sessions`
+- `open_app_config_folder`
+- `open_config_folder`
+- `open_file_dialog`
+- `open_hermes_web_ui`
+- `open_workspace_directory`
+- `open_zip_file_dialog`
+- `pick_directory`
+- `read_daily_memory_file`
+- `read_omo_local_file`
+- `read_omo_slim_local_file`
+- `read_workspace_file`
+- `rebuild_codex_usage`
+- `record_models_dev_sync_result`
+- `rename_db_backup`
+- `restore_db_backup`
+- `restore_env_backup`
+- `reveal_app_log_file`
+- `reveal_backup_location`
+- `reveal_session_path`
+- `s3_sync_download`
+- `s3_sync_fetch_remote_info`
+- `s3_sync_save_settings`
+- `s3_sync_upload`
+- `s3_test_connection`
+- `save_file_dialog`
+- `save_models_dev_sync_config`
+- `scan_openclaw_config_health`
+- `search_daily_memory_files`
+- `set_auto_launch`
+- `set_hermes_memory`
+- `set_hermes_memory_enabled`
+- `set_openclaw_agents_defaults`
+- `set_openclaw_default_model`
+- `set_openclaw_env`
+- `set_openclaw_model_catalog`
+- `set_openclaw_tools`
+- `set_window_theme`
+- `stream_check_provider`
+- `stream_session_messages`
+- `sync_current_providers_live`
+- `sync_session_usage`
+- `take_tray_navigation`
+- `update_model_pricing`
+- `update_model_pricing_batch`
+- `update_tray_menu`
+- `webdav_sync_download`
+- `webdav_sync_fetch_remote_info`
+- `webdav_sync_save_settings`
+- `webdav_sync_upload`
+- `webdav_test_connection`
+- `write_daily_memory_file`
+- `write_workspace_file`
+
+## 后端定义了但前端没调（死代码，或前端用了别的路径）
+
+- `extract_common_config_snippet`
+- `get_claude_common_config_snippet`
+- `get_claude_config_status`
+- `get_claude_plugin_status`
+- `get_common_config_snippet`
+- `get_config_status`
+- `get_hermes_live_provider`
+- `import_from_deeplink`
+- `is_claude_plugin_applied`
+- `query`
+- `read_claude_plugin_config`
+- `set_claude_common_config_snippet`
+- `set_common_config_snippet`
+- `test`

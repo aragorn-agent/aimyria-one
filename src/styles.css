@@ -1,0 +1,919 @@
+/*
+ * Aimyria One — the whole stylesheet.
+ *
+ * The palette is fixed by the brand: warm paper background, near-black ink,
+ * one terracotta accent. There is no blue or purple anywhere in this file, and
+ * there must never be — it would read as a different product.
+ *
+ * Tokens:
+ *   --paper   #f5f5f7  background
+ *   --ink     #000000  primary text
+ *   --ink-2   #0d0d0f  secondary text
+ *   --ink-3   #8a8a88  muted text, hairlines
+ *   --brand   #e9f1f9  the one accent: primary actions, active state
+ *   --warn    #ffffff  low balance
+ *   --danger  #B4453A  failures
+ */
+
+:root {
+  --paper: #f5f5f7;
+  --surface: #ffffff;
+  /* The one white in the system: the toggle knob, which has to read as a
+     physical control against the terracotta track rather than as paper. */
+  --knob: #ffffff;
+  --ink: #000000;
+  --ink-2: #0d0d0f;
+  --ink-3: #8a8a88;
+  --brand: #e9f1f9;
+  --brand-ink: #ffffff;
+  --warn: #ffffff;
+  --danger: #b4453a;
+  --hairline: rgba(20, 20, 19, 0.1);
+  --raised: rgba(20, 20, 19, 0.04);
+
+  --radius: 10px;
+  --radius-sm: 6px;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB",
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  /* The window is a tool panel, not a document: no rubber-band scroll. */
+  overflow: hidden;
+  user-select: none;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* ── Shell ────────────────────────────────────────────────────────────── */
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* The title bar doubles as the window drag handle on Windows (Overlay). */
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  flex: 0 0 auto;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--paper);
+}
+
+.wordmark {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.wordmark em {
+  font-style: normal;
+  color: var(--brand);
+}
+
+.titlebar-spacer {
+  flex: 1;
+  height: 100%;
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  color: var(--ink-3);
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.icon-button:hover {
+  background: var(--raised);
+  color: var(--ink);
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px 28px;
+}
+
+/* ── Tabs ─────────────────────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  flex: 0 0 auto;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.tab {
+  padding: 9px 12px;
+  color: var(--ink-3);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color 120ms ease;
+}
+
+.tab:hover {
+  color: var(--ink-2);
+}
+
+.tab[aria-selected="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--brand);
+  font-weight: 500;
+}
+
+/* ── Balance ──────────────────────────────────────────────────────────── */
+
+.balance {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--raised);
+  font-variant-numeric: tabular-nums;
+}
+
+.balance-label {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.balance-value {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.balance[data-low="true"] {
+  background: rgba(217, 119, 87, 0.14);
+}
+
+.balance[data-low="true"] .balance-value {
+  color: var(--warn);
+}
+
+.balance[data-error="true"] .balance-value {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+
+/* ── Notices ──────────────────────────────────────────────────────────── */
+
+.notice {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  margin-bottom: 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+}
+
+.notice-mark {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 50%;
+  background: var(--ink-3);
+}
+
+.notice[data-tone="warn"] {
+  border-color: rgba(217, 119, 87, 0.4);
+}
+
+.notice[data-tone="warn"] .notice-mark {
+  background: var(--warn);
+}
+
+.notice[data-tone="danger"] {
+  border-color: rgba(180, 69, 58, 0.4);
+}
+
+.notice[data-tone="danger"] .notice-mark {
+  background: var(--danger);
+}
+
+.notice[data-tone="brand"] {
+  border-color: rgba(171, 90, 48, 0.4);
+}
+
+.notice[data-tone="brand"] .notice-mark {
+  background: var(--brand);
+}
+
+.notice-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.notice-body {
+  color: var(--ink-2);
+  font-size: 13px;
+}
+
+.notice-body p {
+  margin: 4px 0 0;
+}
+
+.notice-body code {
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--raised);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ── Client list ──────────────────────────────────────────────────────── */
+
+.section-heading {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+}
+
+.clients {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.client {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 15px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+/* A row that is already correct should look settled, not alarming. */
+.client[data-configured="true"] {
+  border-color: rgba(171, 90, 48, 0.35);
+  background: rgba(171, 90, 48, 0.03);
+}
+
+/* The monogram. Carries the same three states the dot did, so it replaces the
+   dot rather than sitting next to it — one indicator, readable at a glance. */
+.client-mark {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink-2);
+  background: rgba(20, 20, 19, 0.06);
+  border: 1px solid transparent;
+}
+
+.client-mark[data-state="ok"] {
+  color: var(--brand-ink);
+  background: var(--brand);
+}
+
+.client-mark[data-state="idle"] {
+  color: var(--ink-2);
+  background: rgba(20, 20, 19, 0.09);
+}
+
+/* Not installed here: outline rather than fill, so a row the user cannot act
+   on yet reads differently from one they simply have not configured. */
+.client-mark[data-state="missing"] {
+  color: var(--ink-3);
+  background: transparent;
+  border-color: var(--hairline);
+}
+
+.client-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.client-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+}
+
+.client-tag {
+  font-size: 11px;
+  font-weight: 400;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--brand);
+  background: rgba(171, 90, 48, 0.1);
+}
+
+.client-path {
+  font-size: 12px;
+  color: var(--ink-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.dot[data-state="ok"] {
+  background: var(--brand);
+}
+
+.dot[data-state="idle"] {
+  background: var(--ink-3);
+}
+
+.dot[data-state="missing"] {
+  background: transparent;
+  border: 1.5px solid var(--ink-3);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--raised);
+}
+
+.button:disabled {
+  opacity: 0.45;
+}
+
+.button-primary {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--brand-ink);
+  font-weight: 500;
+}
+
+.button-primary:hover:not(:disabled) {
+  background: #8fa9c4;
+  border-color: #8fa9c4;
+}
+
+.button-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--brand);
+  padding: 4px 8px;
+}
+
+.button-quiet:hover:not(:disabled) {
+  background: rgba(171, 90, 48, 0.1);
+}
+
+.button-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* ── Settings rows ────────────────────────────────────────────────────── */
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+  margin-bottom: 20px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 13px 15px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.row-title {
+  font-weight: 500;
+}
+
+.row-hint {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.row-value {
+  font-size: 13px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Toggle ───────────────────────────────────────────────────────────── */
+
+.toggle {
+  position: relative;
+  width: 40px;
+  height: 23px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgba(20, 20, 19, 0.16);
+  transition: background 140ms ease;
+}
+
+.toggle::after {
+  content: "";
+  position: absolute;
+  top: 2.5px;
+  left: 2.5px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--knob);
+  box-shadow: 0 1px 2px rgba(20, 20, 19, 0.25);
+  transition: transform 140ms ease;
+}
+
+.toggle[aria-checked="true"] {
+  background: var(--brand);
+}
+
+.toggle[aria-checked="true"]::after {
+  transform: translateX(17px);
+}
+
+/* ── About ────────────────────────────────────────────────────────────── */
+
+.about-title {
+  font-size: 19px;
+  font-weight: 600;
+  margin: 0 0 2px;
+}
+
+.about-sub {
+  color: var(--ink-3);
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+
+.prose {
+  color: var(--ink-2);
+  max-width: 62ch;
+}
+
+.prose p {
+  margin: 0 0 10px;
+}
+
+.prose a {
+  color: var(--brand);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 16px;
+  font-size: 13px;
+  color: var(--ink-2);
+  margin: 0 0 20px;
+}
+
+.kv dt {
+  color: var(--ink-3);
+}
+
+.kv dd {
+  color: var(--ink-2);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ── 用量统计 ─────────────────────────────────────────────────────────── */
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.stat {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--ink-3);
+  margin-bottom: 6px;
+}
+
+.stat-value {
+  font-size: 21px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+
+.stat-hint {
+  font-size: 11px;
+  color: var(--ink-3);
+  margin-top: 4px;
+}
+
+.panel {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.panel-title {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.seg {
+  display: flex;
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+  overflow: hidden;
+  margin-left: auto;
+}
+
+.seg-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  color: var(--ink-3);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.seg-btn[data-on="true"] {
+  color: var(--brand-ink);
+  background: var(--brand);
+}
+
+.chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 140px;
+  padding: 14px;
+}
+
+.chart-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  gap: 6px;
+}
+
+.chart-bar {
+  width: 100%;
+  max-width: 26px;
+  border-radius: 3px 3px 0 0;
+  background: var(--brand);
+  opacity: 0.85;
+}
+
+.chart-label {
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.data-table th {
+  text-align: left;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--ink-3);
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.data-table td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--ink-2);
+}
+
+.data-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.data-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── MCP ───────────────────────────────────────────────────────────────── */
+
+.data-table th.chk,
+.data-table td.chk {
+  text-align: center;
+  /* "Claude Code" is the longest label and it was wrapping onto two lines at the
+     width this column used to have. One client name per line is the whole point
+     of the header — a column that says "Claude" above "Code" reads as two. */
+  width: 100px;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+/* A box, not a native <input type=checkbox>: the latter inherits the OS accent
+   colour, which on Windows is blue, and this brand has no blue in it. */
+.chk-box {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+  color: var(--brand-ink);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-grid;
+  place-items: center;
+}
+
+.chk-box[aria-checked="true"] {
+  background: var(--brand);
+  border-color: var(--brand);
+}
+
+.chk-box:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.mcp-name {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.mcp-cmd {
+  font-size: 11px;
+  color: var(--ink-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+/* On its own line and truncated, unlike the command above it.
+   A description is a label for the row; the command is its identity and stays
+   fully readable. Sharing one line meant a long description wrapped and left a
+   single trailing character on the next line. */
+.mcp-desc {
+  font-size: 11px;
+  color: var(--ink-3);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.data-table td.act {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.link-btn {
+  font-size: 12px;
+  color: var(--ink-3);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.link-btn:hover {
+  color: var(--danger);
+}
+
+.link-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── Skills ──────────────────────────────────────────────────────────────── */
+
+.unmanaged-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.unmanaged-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+/* ── Prompts ─────────────────────────────────────────────────────────────── */
+
+/* The client picker sits above the panel, so it reads as a scope control rather
+   than as one more action. */
+.client-seg {
+  margin-bottom: 12px;
+}
+
+.client-seg .seg-btn[aria-selected="true"] {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--brand-ink);
+}
+
+.path-hint {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+  margin-bottom: 8px;
+}
+
+.prompt-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.prompt-item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.prompt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--brand);
+  color: var(--brand-ink);
+}
+
+.prompt-body {
+  font-size: 12px;
+  color: var(--ink-3);
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 96px;
+  overflow: hidden;
+}
+
+.prompt-actions {
+  margin-top: 6px;
+  display: flex;
+  gap: 8px;
+}
+
+.prompt-editor {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.prompt-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.prompt-input:focus {
+  outline: none;
+  border-color: var(--brand);
+}
+
+.muted {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+/* Respect the OS setting rather than animating regardless. */
+
+/* ── Feedback ─────────────────────────────────────────────────────────── */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Respect the OS setting rather than animating regardless. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

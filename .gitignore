@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+src-tauri/target/
+release/
+
+# Local env
+.env
+.env.local
+*.tsbuildinfo
+.npmrc
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+.history/
+nul
+
+# ─────────────────────────────────────────────────────────────────────────
+# The files this tool writes into the user's home directory.
+#
+# If you run the tool from a source checkout on your own machine, these get
+# created and then show up as untracked noise in any repo you keep under ~.
+# ─────────────────────────────────────────────────────────────────────────
+.claude/
+.codex/
+.gemini/
+.openclaw/
+.config/opencode/
+.aimyria/
+.cc-switch/
+
+# Test / tooling artefacts
+vitest-report.json
+coverage/
+
+# Local build/verification logs.
+#
+# These are per-machine transcripts (build timings, verification runs). They are
+# not source, they churn on every build, and they contain absolute paths from
+# whoever ran them.
+.*.log
+.*.out
+.visual-check/
+
+# Backups written next to the thing they replace (the updater keeps `.old` copies
+# of the running exe, and release staging keeps timestamped copies).
+*.old
+*.bak
+*.bak-*
+*.bak2-*
