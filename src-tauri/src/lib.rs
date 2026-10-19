@@ -454,12 +454,23 @@ pub fn run() {
 
                 if settings.minimize_to_tray_on_close {
                     api.prevent_close();
-                    let _ = window.hide();
-                    log::info!("关闭请求已处理：最小化到托盘");
+                    // Order matters: drop the taskbar button **while the window is still
+                    // visible**, then hide it.
+                    //
+                    // On Windows, Tauri implements `set_skip_taskbar` by switching the
+                    // window to ToolWindow style, and a style change on an already-hidden
+                    // window is not guaranteed to be applied or repainted -- which is
+                    // exactly why the old `set_skip_taskbar(true)` on the hidden silent
+                    // window measured as a no-op (`transitions=0`, `WS_EX_APPWINDOW` still
+                    // set; see the note in the silent_startup branch). Doing it in this
+                    // order means the button is really gone before the window leaves the
+                    // screen, instead of leaving a dead taskbar button behind.
                     #[cfg(target_os = "windows")]
                     {
                         let _ = window.set_skip_taskbar(true);
                     }
+                    let _ = window.hide();
+                    log::info!("关闭请求已处理：最小化到托盘");
                     #[cfg(target_os = "macos")]
                     {
                         tray::apply_tray_policy(window.app_handle(), false);
@@ -1153,10 +1164,35 @@ pub fn run() {
                     let _ = window.set_shadow(true);
                 }
                 if settings.silent_startup {
-                    // 静默启动模式：保持窗口隐藏
+                    // 静默启动模式：保持窗口隐藏。
+                    //
+                    // # 关于任务栏：`skipTaskbar: true` 不是本 bug 的修复
+                    //
+                    // `tauri.conf.json` 的 main 窗口现在声明 `"skipTaskbar": true`。
+                    // **它没有修掉任何东西** —— 必须写清楚，否则下一个人会以为它修过。
+                    //
+                    // 原来的推断是：窗口创建时任务栏先出现一个按钮，随后被这里的
+                    // `set_skip_taskbar(true)` 移除 → "闪一下"，所以改成创建阶段就设对。
+                    // **这个推断已被证伪**：用未修复的旧构建做对照，主窗口 `visible=false`
+                    // 且从未 `show()` 过，因此**从来就没有任务栏按钮**（Windows 只给可见的
+                    // 顶层窗口放按钮），所谓"先出现再消失"在静默路径上不存在。
+                    //
+                    // 那为什么保留？因为它把默认值设**对**了：一个"静默启动、托盘常驻"的
+                    // 窗口本来就不该在创建阶段具备任务栏资格；而且将来任何一次 `show()`
+                    // 都会由那 4 处 `set_skip_taskbar(false)` 正确恢复。零成本、语义更严密。
+                    //
+                    // # 这里原本那句 `set_skip_taskbar(true)` 为什么删了
+                    //
+                    // 它没有任何效果，留着只会让后人以为任务栏已处理。实测（运行中进程，
+                    // 每 60ms 采样主窗口 exStyle，共 6 秒）：`firstExStyle=0x40110`、
+                    // `WS_EX_APPWINDOW` 恒为 True、`transitions=0`。
+                    //
+                    // 至于"为什么它没效果"，`ITaskbarList` 那位同学给出了更准确的答案：
+                    // tao 0.34.6 把 `skip_taskbar` 实现为
+                    // `taskbar_list.DeleteTab(hwnd)` / `AddTab(hwnd)` —— **一个 COM 调用，
+                    // 根本不改扩展样式**。所以"读 `WS_EX_APPWINDOW` 判断有没有任务栏按钮"
+                    // 这套判据从头到尾就是错的，既不能证明有、也不能证明没有。
                     let _ = window.hide();
-                    #[cfg(target_os = "windows")]
-                    let _ = window.set_skip_taskbar(true);
                     #[cfg(target_os = "macos")]
                     tray::apply_tray_policy(app.handle(), false);
                     log::info!("静默启动模式：主窗口已隐藏");

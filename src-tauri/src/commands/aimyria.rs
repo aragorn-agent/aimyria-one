@@ -549,29 +549,44 @@ fn points_at_aimyria(path: &std::path::Path) -> bool {
 /// rather than the provider table so a selected-but-never-written provider does
 /// not turn the icon green.
 pub fn any_client_configured() -> bool {
-    for spec in live_writer::CLIENTS {
-        let app_type = spec.app_type.clone();
-        if live_writer::live_path(&app_type)
-            .as_deref()
-            .is_some_and(points_at_aimyria)
-        {
-            return true;
-        }
-    }
-    for app in [
+    live_writer::CLIENTS.iter().any(|spec| {
+        client_configured(&spec.app_type)
+    }) || [
         crate::aimyria_apps::AimyriaOnlyApp::WorkBuddy,
         crate::aimyria_apps::AimyriaOnlyApp::DeepSeekHarness,
-    ] {
-        if let Ok(text) = std::fs::read_to_string(app.live_path()) {
-            if text.contains(RELAY_HOST)
+    ]
+    .iter()
+    .any(|app| aimyria_only_app_configured(*app))
+}
+
+/// Whether *this* client's live config points at one of our relays.
+///
+/// The per-app half of [`any_client_configured`], for the tray menu's per-row
+/// marker: the owner asked to be able to see **which** client the import landed
+/// in, and "at least one client somewhere is configured" cannot answer that.
+///
+/// Same evidence, same semantics, and therefore the same colour language: this
+/// deliberately contains no new notion of "configured", because two definitions of
+/// green would be worse than one that is occasionally conservative. It reads the
+/// live config file rather than the provider table for the same reason the
+/// aggregate does -- a provider that was selected but never written must not mark
+/// the row as imported.
+pub fn client_configured(app_type: &AppType) -> bool {
+    live_writer::live_path(app_type)
+        .as_deref()
+        .is_some_and(points_at_aimyria)
+}
+
+/// [`client_configured`] for the two apps that are ours alone rather than a
+/// wrapped third-party CLI, and so have no `ClientSpec` entry.
+fn aimyria_only_app_configured(app: crate::aimyria_apps::AimyriaOnlyApp) -> bool {
+    std::fs::read_to_string(app.live_path())
+        .map(|text| {
+            text.contains(RELAY_HOST)
                 || text.contains(RELAY_ALT_HOST)
                 || text.contains(crate::aimyria_apps::PROVIDER_KEY)
-            {
-                return true;
-            }
-        }
-    }
-    false
+        })
+        .unwrap_or(false)
 }
 
 /// The relay host we configure clients to talk to.

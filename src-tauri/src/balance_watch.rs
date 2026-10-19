@@ -122,16 +122,25 @@ pub async fn check_once(app: &AppHandle) {
 
     if below && !was_below {
         log::info!("余额 ${remaining:.2} 低于 ${LOW_BALANCE_USD:.2}，提醒用户");
-        // Only interrupt if the window is not already in front of the user:
-        // re-focusing a window they are already reading is the definition of
-        // background software misbehaving.
-        let already_visible = app
-            .get_webview_window("main")
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false);
-        if !already_visible {
-            crate::tray::show_main_window(app);
-        }
+        // Deliberately does NOT raise the main window.
+        //
+        // It used to (`crate::tray::show_main_window(app)`), which conflicts head-on
+        // with what this product is: a tray tool that starts silently and stays out
+        // of the way. Balance is polled every fifteen minutes whether or not the user
+        // is doing anything, so that call could put the full window on screen at an
+        // arbitrary moment -- reported by the owner as windows that "keep flashing
+        // while it is running". Pushing a UI at someone who did not ask for one is the
+        // definition of background software misbehaving, and this module's own docs
+        // promise the opposite ("Never blocks work", "it is not noisier than this").
+        //
+        // The warning still reaches the user, through the two channels that respect
+        // the tray model:
+        //   * the `relay-balance` event above, for an open window, and
+        //   * the tray icon's problem dot plus its tooltip, refreshed here.
+        //
+        // The `already_visible` guard that used to gate this is gone with it: there is
+        // nothing left to guard.
+        crate::tray::refresh_tray_menu(app);
     }
 }
 

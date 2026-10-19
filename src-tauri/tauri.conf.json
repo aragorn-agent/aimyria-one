@@ -20,8 +20,8 @@
         "minWidth": 720,
         "minHeight": 520,
         "visible": false,
-        "resizable": true,
-        "fullscreen": false,
+        "skipTaskbar": true,
+        "resizable": true,        "fullscreen": false,
         "center": true,
         "visibleOnAllWorkspaces": false
       }

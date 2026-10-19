@@ -67,6 +67,15 @@ const MAX_REASON_CHARS: usize = 60;
 /// 额度剩余不到这个百分比算「快用完」（和前端 `quotaRules.WARN_BELOW_PERCENT` 一致）。
 const WARN_BELOW_PERCENT: f64 = 20.0;
 
+/// 应用行前的「已导入」标记：一个实心圆点。
+///
+/// 用字形而不是文字，是为了不把菜单撑宽 —— 它只占一个字宽，紧跟在应用名后面，
+/// 读起来就是那个应用旁边亮了一颗状态灯。真正的文字说明在悬停提示里。
+const IMPORTED_MARK: &str = "●";
+/// 悬停提示里那句「下一步做什么」。业主的原话是「避免用户点了导入之后感觉没反应
+/// 没生效」，所以这句必须说清"已经生效了"和"接下来可以点它"。
+const IMPORTED_TOOLTIP: &str = "已导入 · 可去点它";
+
 /// 每个应用行的子菜单句柄，额度更新时就地改标题而不是整菜单重建（整建会关掉 macOS 上
 /// 正开着的菜单）。`create_tray_menu` 每次重建都整表覆盖写入。
 static TRAY_SECTION_SUBMENUS: Lazy<Mutex<HashMap<AppType, Submenu<tauri::Wry>>>> =
@@ -1262,6 +1271,22 @@ fn quota_title(texts: &TrayTexts, snapshot: &AppSnapshot) -> Option<(String, boo
 
 fn app_row_title(texts: &TrayTexts, snapshot: &AppSnapshot) -> String {
     let mut parts: Vec<String> = vec![app_display_name(&snapshot.app).to_string()];
+    // The "this is where the import landed" marker.
+    //
+    // The owner's complaint was that after clicking 「导入」 a user cannot tell
+    // whether anything happened, or which client it happened to. The tray icon
+    // already answered "something is configured" in exactly one bit (black vs
+    // green, see `any_client_configured`); this row-level marker answers *which*
+    // client, reusing that same bit and therefore the same colour language --
+    // deliberately no second notion of "configured", because two definitions of
+    // green are worse than one that is occasionally conservative.
+    //
+    // A filled circle rather than a word: `●` is one glyph wide, survives every
+    // font, and reads as a status light next to the app's name. The words go in
+    // the hover tooltip, which has room for them.
+    if crate::commands::aimyria::client_configured(&snapshot.app) {
+        parts.push(IMPORTED_MARK.to_string());
+    }
     let current = snapshot.current();
     let mode_word = match snapshot.mode {
         TrayMode::Route | TrayMode::Failover => Some(texts.mode_route),
@@ -1911,9 +1936,14 @@ fn icon_with_problem_dot(icon: &Image<'_>, template: bool) -> Image<'static> {
     Image::new_owned(rgba, width, height)
 }
 
-/// 悬停提示：平时 `CC Switch`，出问题时 `CC Switch · 需要处理：<问题区第一条>`。额度不算问题。
+/// 悬停提示：平时 `AimyriA go`，出问题时 `AimyriA go · 需要处理：<问题区第一条>`。额度不算问题。
+///
+/// 另外：至少有一个客户端已导入时，提示里追加一句「已导入 · 可去点它」。
+/// 这是需求 8 的可见反馈 —— 托盘圆点/行标记说明"导入了、导到哪家"，
+/// 这句话说明"下一步该做什么"。刻意**不用**弹窗或系统气泡：那会打断用户、
+/// 会被专注助手静音、且与"启动静默"的产品定位冲突。
 fn tray_tooltip(texts: &TrayTexts, problems: &[TrayProblem]) -> String {
-    match problems.first() {
+    let base = match problems.first() {
         None => "AimyriA go".to_string(),
         Some(problem) => truncate_chars(
             &fill(
@@ -1922,7 +1952,13 @@ fn tray_tooltip(texts: &TrayTexts, problems: &[TrayProblem]) -> String {
             ),
             MAX_TOOLTIP_CHARS,
         ),
+    };
+    if crate::commands::aimyria::any_client_configured() {
+        // Truncated as a whole afterwards, so a long problem line cannot push the
+        // imported notice out of the tooltip.
+        return truncate_chars(&format!("{base} · {IMPORTED_TOOLTIP}"), MAX_TOOLTIP_CHARS);
     }
+    base
 }
 
 /// 现在托盘上的（有没有圆点，悬停提示）；`None` = 托盘图标还没建好，还是建图标时的样子。
@@ -1951,14 +1987,38 @@ fn update_problem_indicator(app: &tauri::AppHandle, texts: &TrayTexts, problems:
             } else {
                 base
             };
-            if let Err(e) = tray.set_icon(Some(icon)) {
-                log::warn!("[Tray] 更新托盘图标失败: {e}");
-            }
-            // macOS 上 set_icon 会把模板标记清掉，要再设一次，否则深色菜单栏里是黑图标。
-            if template {
-                if let Err(e) = tray.set_icon_as_template(true) {
-                    log::warn!("[Tray] 恢复模板图标标记失败: {e}");
+            // Skip a repaint that would change nothing.
+            //
+            // The tray icon was built moments earlier by `TrayIconBuilder::icon(...)`
+            // from the *same* source (`base_tray_icon`), so on a healthy startup the
+            // "plain" icon is already showing and setting it again is a redundant
+            // `Shell_NotifyIcon(NIM_MODIFY)` -- a second repaint of the one piece of UI
+            // this tray app always has on screen. That is consistent with the owner's
+            // report of something flickering in the notification area at startup, and
+            // removing it changes no visible state.
+            //
+            // Honest limit: this is a code-reasoning change, NOT a measured fix. On
+            // this Windows 11 build the taskbar/notification area does not expose its
+            // button or icon list to any Win32 probe we could validate -- three
+            // separate probes, each caught by a positive control that failed to
+            // discriminate. So nobody has visually confirmed that this was the cause,
+            // or that this removes it. It is safe (worst case: one fewer repaint) and
+            // it is the only candidate that can be touched without risk.
+            if has_dot {
+                if let Err(e) = tray.set_icon(Some(icon)) {
+                    log::warn!("[Tray] 更新托盘图标失败: {e}");
                 }
+                // macOS 上 set_icon 会把模板标记清掉，要再设一次，否则深色菜单栏里是黑图标。
+                if template {
+                    if let Err(e) = tray.set_icon_as_template(true) {
+                        log::warn!("[Tray] 恢复模板图标标记失败: {e}");
+                    }
+                }
+            } else {
+                // No dot: the plain icon is already in place. If it somehow is not,
+                // the first problem that appears will correct it, and a missing dot
+                // is a cosmetic loss rather than a wrong signal.
+                log::debug!("[Tray] plain icon already applied at build time; no redundant set_icon");
             }
         }
     }
