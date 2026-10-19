@@ -150,7 +150,7 @@ jobs:
           echo "AR=ar" >> $env:GITHUB_ENV
 
       - name: 恢复前端产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
