@@ -378,12 +378,6 @@ pub fn run() {
                 log::debug!("  arg[{i}]: {}", url_for_log(arg));
             }
 
-            if crate::lightweight::is_lightweight_mode() {
-                if let Err(e) = crate::lightweight::exit_lightweight_mode(app) {
-                    log::error!("退出轻量模式重建窗口失败: {e}");
-                }
-            }
-
             // Check for deep link URL in args (mainly for Windows/Linux command line)
             let mut found_deeplink = false;
             for arg in &args {
@@ -393,26 +387,68 @@ pub fn run() {
                 }
             }
 
-            if !found_deeplink {
-                log::info!("ℹ No deep link URL found in args (this is expected on macOS when launched via system)");
+            // Leaving lightweight mode rebuilds the main window -- and
+            // `exit_lightweight_mode` ends by calling `show()` + `set_focus()`, so it
+            // is a window-raise too. It must therefore be driven by the same
+            // condition as the raise below, not run before it. Previously this ran
+            // unconditionally, which meant a link-less second launch exited
+            // lightweight mode (rebuilding and focusing the window) and then raised
+            // it again: two raises for one launch nobody asked for.
+            //
+            // Order matters and is now: decide first, act once.
+            if found_deeplink && crate::lightweight::is_lightweight_mode() {
+                if let Err(e) = crate::lightweight::exit_lightweight_mode(app) {
+                    log::error!("退出轻量模式重建窗口失败: {e}");
+                }
             }
 
-            // Show and focus window regardless
-            if let Some(window) = app.get_webview_window("main") {
-                // 防御性重置 Windows 的 skip_taskbar：single_instance 触发时，
-                // 原进程可能因 silent_startup / 关闭到托盘等处于 skip_taskbar(true) 状态，
-                // 仅 show() 不会重置该状态，会导致窗口可见但不在任务栏、最小化后消失。
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = window.set_skip_taskbar(false);
-                }
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "linux")]
-                {
-                    linux_fix::nudge_main_window(window.clone(), "single-instance");
-                }
+            if !found_deeplink {
+                log::info!("ℹ No deep link URL found in args");
+            }
+
+            // Show the window ONLY when the second launch actually asked for something.
+            //
+            // # What was wrong
+            //
+            // This block used to run unconditionally -- the comment said so out loud:
+            // "Show and focus window regardless". The single-instance callback is
+            // invoked by *any* second launch of the exe, and a second launch with no
+            // deep link is not a request to see the UI: it is a script, a duplicated
+            // autostart entry, a scheduled task, an installer probe, or -- worst --
+            // the updater restarting the app after it replaced the executable. Each of
+            // those popped the window to the front and stole focus.
+            //
+            // Measured, and it is why this changed: during a self-update run the log
+            // recorded, in adjacent lines,
+            //
+            //   [00:18:13] 静默启动模式：主窗口已隐藏
+            //   [00:18:14] === Single Instance Callback Triggered ===
+            //   [00:18:14] ℹ No deep link URL found in args
+            //   [00:18:15] [updater] holding the replacement: window_visible=true
+            //
+            // -- the app hid its window, then a link-less second launch brought it
+            // back, and the updater's own "is the user mid-import" guard concluded a
+            // human was working and deferred. Two bugs from one unconditional `show()`:
+            // a window on screen nobody asked for (the owner's "窗口一直闪"), and a
+            // self-update that stalls.
+            //
+            // # Why "a deep link arrived" is the right condition
+            //
+            // It is the only thing a second launch can legitimately be asking for.
+            // `handle_deeplink_url` already raises the window itself on the success
+            // path (`tray::show_main_window`), so showing it again here would be a
+            // second, redundant raise -- which is another flicker, and the reason the
+            // old code's `set_skip_taskbar(false)`/`unminimize`/`show`/`set_focus`
+            // sequence is not simply moved inside the `if`.
+            //
+            // An explicit "user wants the UI back" affordance already exists and does
+            // not need this path: the tray icon's left click calls
+            // `tray::show_main_window`. Anything that wants the window should say so
+            // through that, or through a deep link -- not by re-launching the binary.
+            if found_deeplink {
+                log::info!("Single-instance wake carried a deep link; the window is raised by the deep-link handler");
+            } else {
+                log::info!("Single-instance wake carried no deep link; leaving the window exactly as the user left it");
             }
         }));
     }

@@ -1,4 +1,4 @@
-# B2 -- the silent self-update, run for real, both paths.
+﻿# B2 -- the silent self-update, run for real, both paths.
 #
 # WHY THIS IS A SCRIPT AND NOT A LIST OF COMMANDS
 #
@@ -74,6 +74,12 @@ param(
   [int]$PortSuccess = 8799,
   [int]$PortFailure = 8800,
   [int]$TimeoutSeconds = 120,
+  # The version the served manifest advertises. MUST be strictly greater than the
+  # installed build's own version, or the updater correctly concludes "up to date" and
+  # never exercises the download/replace path. Passing 1.0.1 here would test nothing --
+  # which is exactly what happened on the first attempt: the log said
+  # "up to date: running v1.0.1, manifest has v1.0.1" and every later assertion was moot.
+  [string]$ManifestVersion = "1.0.2",
   [string]$NodeExe = "node"
 )
 
@@ -170,13 +176,23 @@ Copy-Item -LiteralPath $NewExe (Join-Path $serveOk "AimyriaOne-x64.exe") -Force
 "$newHash  AimyriaOne-x64.exe" | Set-Content (Join-Path $serveOk "AimyriaOne-x64.exe.sha256") -Encoding ASCII
 
 $versionJson = [ordered]@{
-  version = "1.0.1"
+  version = $ManifestVersion
   url     = "http://127.0.0.1:$PortSuccess/releases/latest/download/AimyriaOne-x64.exe"
   sha256  = $newHash
   notes   = "silent self-update acceptance run (success path)"
   pubDate = (Get-Date).ToString("yyyy-MM-ddTHH:mm:sszzz")
 }
-$versionJson | ConvertTo-Json | Set-Content (Join-Path $serveOk "version.json") -Encoding UTF8
+$versionJson | ConvertTo-Json | Set-Content (Join-Path $serveOk "version.json") -Encoding ASCII
+# Verify the manifests are BOM-free. A UTF-8 BOM is the difference between a
+# working channel and an opaque "error decoding response body": serde_json refuses
+# a BOM-prefixed document. PowerShell 5.1's `Set-Content -Encoding UTF8` writes one,
+# so this is a real trap for whoever edits this script next -- assert the bytes.
+foreach ($mf in @((Join-Path $serveOk "version.json"), (Join-Path $serveBad "version.json"))) {
+  $raw = [System.IO.File]::ReadAllBytes($mf)
+  $hasBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
+  if ($hasBom) { Fail ("manifest has a UTF-8 BOM: " + $mf + " -- the updater will refuse it (that is the bug this run is meant to exercise, not reproduce)") }
+  else { Pass ("manifest is BOM-free: " + (Split-Path $mf -Parent | Split-Path -Leaf) + " (" + $raw.Length + " bytes)") }
+}
 Info ("served (success): " + (Join-Path $serveOk "version.json"))
 
 # The failure path is the same manifest with the hash of *different* bytes: the
@@ -186,13 +202,13 @@ Info ("served (success): " + (Join-Path $serveOk "version.json"))
 Copy-Item -LiteralPath $NewExe (Join-Path $serveBad "AimyriaOne-x64.exe") -Force
 $wrongHash = ([string]::Join("", (1..64 | ForEach-Object { "0" })))
 $versionJsonBad = [ordered]@{
-  version = "1.0.1"
+  version = $ManifestVersion
   url     = "http://127.0.0.1:$PortFailure/releases/latest/download/AimyriaOne-x64.exe"
   sha256  = $wrongHash
   notes   = "silent self-update acceptance run (failure path: wrong sha256 on purpose)"
   pubDate = (Get-Date).ToString("yyyy-MM-ddTHH:mm:sszzz")
 }
-$versionJsonBad | ConvertTo-Json | Set-Content (Join-Path $serveBad "version.json") -Encoding UTF8
+$versionJsonBad | ConvertTo-Json | Set-Content (Join-Path $serveBad "version.json") -Encoding ASCII
 Info ("served (failure): " + (Join-Path $serveBad "version.json"))
 Info ("  manifest claims sha256 = $wrongHash")
 Info ("  payload really is      = $newHash")
@@ -395,13 +411,13 @@ if (-not $replaced) {
 }
 
 Info "  -- assertion: the restarted process logs the new version --"
-$restartEvidence = $logText -split "`r?`n" | Where-Object { $_ -match '=== AimyriA go v1\.0\.1 started ===' }
+$restartEvidence = $logText -split "`r?`n" | Where-Object { $_ -match '=== AimyriA go v1\.0\.2 started ===' }
 if ($restartEvidence) {
-  Pass "B2 success: the restarted instance logged 'v1.0.1 started'"
+  Pass "B2 success: the restarted instance logged 'v1.0.2 started'"
   $restartEvidence | Select-Object -First 1 | ForEach-Object { Info ("    " + $_.Trim()) }
 } else {
   $anyStarted = $logText -split "`r?`n" | Where-Object { $_ -match 'started ===' }
-  Fail "B2 success: no 'v1.0.1 started' line; saw: " + (($anyStarted | Select-Object -First 3) -join " | ")
+  Fail "B2 success: no 'v1.0.2 started' line; saw: " + (($anyStarted | Select-Object -First 3) -join " | ")
 }
 $cleanupLines = $logText -split "`r?`n" | Where-Object { $_ -match '\[updater\].*(previous update completed|running v)' }
 if ($cleanupLines) {
@@ -502,6 +518,11 @@ else {
 # Both protocol keys and (potentially) the Run value were repointed at test-tree
 # paths by the test instances' own launch bootstrap. Leaving them there would send
 # every future 「导入到CCS」 on this machine to a deleted file.
+# Stray processes would keep the tree locked and could re-register after the restore
+# below, so they go first -- and the restore is re-checked afterwards.
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Work, [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
 Section "6. restore the registry (the test instances repointed it)"
 $restoreAimyria = Read-RegDefault $RegAimyria
 $restoreCcswitch = Read-RegDefault $RegCcswitch
@@ -516,14 +537,49 @@ function Get-ExeFromCommand($command) {
   return ""
 }
 
+# The restore target must be a REAL INSTALL, never a test copy.
+#
+# This script snapshots whatever is registered when it starts, and restores that at
+# the end. That is right when the run starts from a clean machine -- and wrong when
+# the previous run left a temp copy registered, because then this run faithfully
+# "restores" a path that is about to be deleted. That is exactly what happened: a
+# B2 run started while %TEMP%\aimyria-second-launch\run\... was still registered, and
+# dutifully put it back at the end, leaving the machine pointing at a doomed copy.
+#
+# So a target under TEMP (or under this run's work tree) is treated as
+# "no trustworthy snapshot": fall back to the real per-user install, which is what
+# the machine should point at anyway.
 $target = ""
 if ($beforeAimyria) { $target = Get-ExeFromCommand $beforeAimyria }
+$realInstall = Join-Path $env:LOCALAPPDATA "Aimyria\AimyriaOne.exe"
+$targetIsTestCopy = $target -and (($target -match '[\\/]Temp[\\/]') -or $target.StartsWith($Work, [StringComparison]::OrdinalIgnoreCase))
+if ($targetIsTestCopy) {
+  Info ("IGNORING the pre-run target because it is a test copy: " + $target)
+  if (Test-Path -LiteralPath $realInstall) { $target = $realInstall }
+  Info ("falling back to the real install: " + $target)
+}
 Info ("restoring the pre-run target: $target")
 if ($target -and (Test-Path -LiteralPath $target)) {
-  foreach ($key in @($RegAimyria, $RegCcswitch)) {
-    reg add $key /ve /d "`"$target`" `"%1`"" /f | Out-Null
+  # Written through the .NET registry API, NOT `reg add`.
+  #
+  # `reg add ... /d '"C:\path\app.exe" "%1"'` was measured dropping the leading
+  # quote, storing `C:\path\app.exe "%1"`. That happens to still launch for a path
+  # without spaces and silently breaks the moment the install path has one -- and it
+  # is not byte-identical to the value being restored, which is the whole point of a
+  # restore. SetValue with an explicit String kind stores exactly the characters given.
+  $q = [char]34
+  $cmd = $q + $target + $q + ' ' + $q + '%1' + $q
+  foreach ($pair in @(
+      @{ sub = 'Software\Classes\aimyria\shell\open\command'; name = '' },
+      @{ sub = 'Software\Classes\ccswitch\shell\open\command'; name = '' }
+    )) {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($pair.sub, $true)
+    if ($k) { try { $k.SetValue($pair.name, $cmd, [Microsoft.Win32.RegistryValueKind]::String) } finally { $k.Close() } }
   }
-  if ($beforeRun) { reg add $RegRun /v "AimyriA go" /t REG_SZ /d $beforeRun /f | Out-Null }
+  if ($beforeRun) {
+    $kr = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run', $true)
+    if ($kr) { try { $kr.SetValue('AimyriA go', $beforeRun, [Microsoft.Win32.RegistryValueKind]::String) } finally { $kr.Close() } }
+  }
   Start-Sleep -Seconds 1
   $nowAimyria = Read-RegDefault $RegAimyria
   $nowCcswitch = Read-RegDefault $RegCcswitch

@@ -627,22 +627,40 @@ mod tests {
         assert!(!RELAY_HOST.contains(' '));
     }
 
+    /// `low` is a plain field on `RelayBalance`, not something the struct derives:
+    /// it is set by whoever builds the struct, at the one place that has a real
+    /// balance to judge (`check_balance` builds it as
+    /// `remaining.is_some_and(|r| r < LOW_BALANCE_USD)`).
+    ///
+    /// This test previously built the struct with `..Default::default()` and then
+    /// asserted `under.low` was true -- reading a field it had just left at its
+    /// default of `false`, so it could never pass. It had been red in the tree and
+    /// was found while adding the marker-parity test below. The fix is to have the
+    /// fixture set the field the same way production does, and to keep asserting the
+    /// boundary the production expression defines.
     #[test]
     fn low_balance_only_fires_on_a_known_balance() {
-        let unknown = RelayBalance::default();
-        assert!(!unknown.low, "an unknown balance must not read as low");
+        // Mirrors `check_balance`: unknown -> false, below -> true, at -> false.
+        fn low_for(remaining: Option<f64>) -> bool {
+            remaining.is_some_and(|r| r < LOW_BALANCE_USD)
+        }
 
+        assert!(!low_for(None), "an unknown balance must not read as low");
+        assert!(low_for(Some(LOW_BALANCE_USD - 0.01)));
+        assert!(
+            !low_for(Some(LOW_BALANCE_USD)),
+            "the threshold itself is not 'low'"
+        );
+
+        // And the struct carries whatever the caller set, defaulting to false.
+        let unknown = RelayBalance::default();
+        assert!(!unknown.low, "a defaulted balance is not low");
         let under = RelayBalance {
             remaining: Some(LOW_BALANCE_USD - 0.01),
+            low: low_for(Some(LOW_BALANCE_USD - 0.01)),
             ..Default::default()
         };
         assert!(under.low);
-
-        let at_threshold = RelayBalance {
-            remaining: Some(LOW_BALANCE_USD),
-            ..Default::default()
-        };
-        assert!(!at_threshold.low, "the threshold itself is not 'low'");
     }
 
     #[test]
@@ -673,5 +691,42 @@ mod tests {
         assert!(!points_at_aimyria(std::path::Path::new(
             "D:/definitely/not/here/settings.json"
         )));
+    }
+
+    /// The per-client marker (requirement 8) and the aggregate tray icon must agree.
+    ///
+    /// `client_configured` exists so the tray menu can show *which* client the import
+    /// landed in, while `any_client_configured` still answers *whether* anything is
+    /// configured. Two functions, one notion of "configured" -- if they ever diverge,
+    /// the menu would show a client as imported while the icon still said nothing had
+    /// happened, which is the opposite of the feedback the owner asked for.
+    ///
+    /// The shared evidence is `points_at_aimyria`, so that is what this pins: the
+    /// per-client answer for a path is exactly the aggregate's answer for that path.
+    #[test]
+    fn the_per_client_marker_uses_the_same_evidence_as_the_aggregate_icon() {
+        let dir = std::env::temp_dir().join("aimyria-one-marker-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // Not ours -> neither says configured.
+        std::fs::write(&path, r#"{"env":{"ANTHROPIC_BASE_URL":"https://elsewhere.example"}}"#).unwrap();
+        assert!(!points_at_aimyria(&path), "the fixture must not count as ours");
+
+        // Ours -> the shared predicate says yes, which is what both callers consult.
+        std::fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.aimyria.com"}}"#,
+        )
+        .unwrap();
+        assert!(points_at_aimyria(&path));
+
+        // The legacy gateway counts too, for the same reason the aggregate does:
+        // installs written against it are configured, not broken.
+        std::fs::write(&path, r#"{"env":{"ANTHROPIC_BASE_URL":"https://321ai.cc/v1"}}"#).unwrap();
+        assert!(points_at_aimyria(&path));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

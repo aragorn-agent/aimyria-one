@@ -243,6 +243,21 @@ fn is_loopback(host: &str) -> bool {
         || host == "::1"
 }
 
+/// Drop a UTF-8 byte-order mark, if present.
+///
+/// `serde_json` refuses a document that starts with one; a publisher's tooling
+/// emitting a BOM is common enough on Windows that tolerating it is cheaper than
+/// diagnosing it. Only the exact three-byte UTF-8 sequence is removed -- UTF-16
+/// manifests are not supported and would still fail loudly, which is correct.
+pub fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+    if bytes.starts_with(&BOM) {
+        &bytes[BOM.len()..]
+    } else {
+        bytes
+    }
+}
+
 /// Append `?t=<unix seconds>` so each check is a distinct cache key.
 ///
 /// See the comment at the manifest fetch site for why this exists alongside the
@@ -679,10 +694,44 @@ async fn check_once(app: &AppHandle) -> bool {
                 log::warn!("{TAG} manifest returned HTTP {status}; staying on v{CURRENT_VERSION}");
                 return false;
             }
-            match response.json::<Manifest>().await {
+            // Read the bytes and strip a UTF-8 BOM before parsing.
+            //
+            // `Response::json()` goes through serde_json, which rejects a body that
+            // begins with a byte-order mark, reporting only "error decoding response
+            // body". A BOM here is not hypothetical: it is what a lot of Windows
+            // tooling produces by default -- PowerShell 5.1's `Set-Content -Encoding
+            // UTF8`, anything on .NET Framework, Notepad's "UTF-8". A publisher
+            // regenerating the manifest with any of those would break the update
+            // channel for every installed copy, silently, with a log line that names
+            // neither the BOM nor the file.
+            //
+            // Measured, and this is why the code is here: with a BOM-prefixed
+            // manifest the updater logged exactly that opaque message and no update
+            // ever ran, while the server answered 200 and the payload hash was
+            // correct. Three bytes are therefore stripped rather than trusted.
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log::warn!("{TAG} could not read the manifest body: {e}");
+                    return false;
+                }
+            };
+            match serde_json::from_slice::<Manifest>(strip_utf8_bom(&bytes)) {
                 Ok(manifest) => manifest,
                 Err(e) => {
-                    log::warn!("{TAG} manifest did not parse as version.json: {e}");
+                    // Include the length and the first bytes: without them a
+                    // "did not parse" line costs an investigation to act on.
+                    let head = bytes
+                        .iter()
+                        .take(24)
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    log::warn!(
+                        "{TAG} manifest did not parse as version.json: {e} \
+                         ({} bytes, first 24: {head})",
+                        bytes.len()
+                    );
                     return false;
                 }
             }
@@ -1179,5 +1228,37 @@ mod tests {
         let manifest: Manifest = serde_json::from_str(wire).expect("the live shape must parse");
         assert_eq!(manifest.version, "1.0.1");
         assert_eq!(manifest.sha256.len(), 64);
+    }
+
+    /// A UTF-8 BOM must not stop the channel.
+    ///
+    /// Regression test for a defect that a real end-to-end run caught and unit
+    /// tests alone had not: `serde_json` refuses a BOM-prefixed document, and the
+    /// symptom is `error decoding response body` -- which names neither the BOM nor
+    /// the file, while the server is answering 200 with correct content. The
+    /// manifest in that run was written by PowerShell's `Set-Content -Encoding
+    /// UTF8`, which on 5.1 emits a BOM, so this is a realistic publisher mistake.
+    #[test]
+    fn a_utf8_bomprefix_does_not_break_the_manifest() {
+        let body = br#"{"version":"1.0.1","url":"https://aimyria.com/x.exe","sha256":"abc","notes":"n"}"#;
+        assert!(
+            serde_json::from_slice::<Manifest>(body).is_ok(),
+            "sanity: the plain body parses"
+        );
+
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(body);
+        assert!(
+            serde_json::from_slice::<Manifest>(&with_bom).is_err(),
+            "sanity: serde_json really does refuse the BOM (this is the bug)"
+        );
+        let manifest: Manifest =
+            serde_json::from_slice(strip_utf8_bom(&with_bom)).expect("BOM stripped, parses");
+        assert_eq!(manifest.version, "1.0.1");
+
+        // A body without a BOM is passed through untouched, byte for byte.
+        assert_eq!(strip_utf8_bom(body), body);
+        // Only the exact UTF-8 sequence is treated as a BOM.
+        assert_eq!(strip_utf8_bom(&[0xEF, 0xBB]), &[0xEF, 0xBB][..]);
     }
 }
