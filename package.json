@@ -1,7 +1,7 @@
 {
   "name": "aimyria-one",
   "private": true,
-  "version": "1.0.4",
+  "version": "1.0.5",
   "type": "module",
   "description": "把 AI 编程命令行一键指向 Aimyria",
   "license": "MIT",

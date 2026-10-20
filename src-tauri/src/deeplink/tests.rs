@@ -1064,3 +1064,134 @@ fn test_infer_homepage_from_endpoint_without_homepage() {
         Some("https://cubence.com".to_string())
     );
 }
+
+// =============================================================================
+// Import id: our relay replaces, another relay accumulates
+// =============================================================================
+//
+// The owner reported importing another relay (FlowNode) after importing ours, and
+// the second import *overwrote* the first instead of adding a row. These pin the
+// two halves of that: a link to us keeps the stable id (rotation), a link to a
+// different relay gets a unique id (accumulation).
+
+#[test]
+fn a_link_to_our_relay_uses_the_stable_provider_id() {
+    use super::provider::{import_provider_id, points_at_our_relay};
+
+    for endpoint in [
+        "https://api.aimyria.com",
+        "https://api.aimyria.com/v1",
+        "https://321ai.cc/v1",
+    ] {
+        assert!(
+            points_at_our_relay(endpoint),
+            "{endpoint} is one of our relays"
+        );
+        assert_eq!(
+            import_provider_id(endpoint, "Aimyria"),
+            crate::live_writer::PROVIDER_ID,
+            "a link to us must keep the stable id so re-import rotates, not accumulates"
+        );
+    }
+}
+
+#[test]
+fn a_link_to_another_relay_gets_a_unique_id() {
+    use super::provider::{import_provider_id, points_at_our_relay};
+
+    let endpoint = "https://flow-node.com/v1";
+    assert!(!points_at_our_relay(endpoint));
+
+    let id = import_provider_id(endpoint, "FlowNode");
+    assert_ne!(
+        id,
+        crate::live_writer::PROVIDER_ID,
+        "another relay's row must not take our id -- that is what made it overwrite ours"
+    );
+    assert!(
+        id.starts_with("FlowNode-"),
+        "the id should stay recognisable in the list, got {id}"
+    );
+
+    // Two imports of the same other relay must produce two different ids, or the
+    // second would still overwrite the first (the bug this fixes).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = import_provider_id(endpoint, "FlowNode");
+    assert_ne!(
+        id, second,
+        "a second import of another relay must be a separate row, not a replacement"
+    );
+}
+
+#[test]
+fn an_unusable_name_still_yields_a_workable_id() {
+    use super::provider::import_provider_id;
+
+    // A display name full of punctuation must not produce an empty or path-like id.
+    let id = import_provider_id("https://other.example/v1", "  ///  ");
+    assert!(
+        id.starts_with("provider-"),
+        "a name with no ASCII alphanumerics falls back to a fixed stem, got {id}"
+    );
+}
+
+/// The owner's report, end to end: import our relay, then import a *different*
+/// relay, and the second must ADD a row rather than replace ours.
+///
+/// The id unit tests above pin the rule; this exercises the real import path
+/// (including `save_provider`'s upsert) so the two cannot drift apart.
+#[test]
+fn importing_another_relay_after_ours_adds_a_row_instead_of_replacing() {
+    let _home = TestHomeGuard::new();
+
+    std::env::set_var("CC_SWITCH_TEST_HOME", std::env::temp_dir());
+    let db = Arc::new(Database::memory().expect("memory db"));
+    let state = AppState::new(db.clone());
+
+    let ours = DeepLinkImportRequest {
+        resource: "provider".to_string(),
+        app: Some("claude".to_string()),
+        name: Some("Aimyria".to_string()),
+        endpoint: Some("https://api.aimyria.com/v1".to_string()),
+        api_key: Some("sk-ours-0001".to_string()),
+        homepage: Some("https://aimyria.com".to_string()),
+        enabled: Some(true),
+        ..Default::default()
+    };
+    let ours_id = tauri::async_runtime::block_on(
+        super::provider::import_provider_from_deeplink(&state, ours),
+    )
+    .expect("import our relay");
+    assert_eq!(ours_id, crate::live_writer::PROVIDER_ID);
+
+    let foreign = DeepLinkImportRequest {
+        resource: "provider".to_string(),
+        app: Some("claude".to_string()),
+        name: Some("FlowNode".to_string()),
+        endpoint: Some("https://flow-node.com/v1".to_string()),
+        api_key: Some("sk-foreign-0001".to_string()),
+        homepage: Some("https://flow-node.com".to_string()),
+        enabled: Some(true),
+        ..Default::default()
+    };
+    let foreign_id = tauri::async_runtime::block_on(
+        super::provider::import_provider_from_deeplink(&state, foreign),
+    )
+    .expect("import the other relay");
+    assert_ne!(
+        foreign_id, ours_id,
+        "another relay must not reuse our id -- that is what overwrote our row"
+    );
+
+    let rows = db.get_all_providers("claude").expect("read providers");
+    assert!(
+        rows.contains_key(&ours_id),
+        "our row must survive importing another relay; rows = {:?}",
+        rows.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        rows.contains_key(&foreign_id),
+        "the other relay must land as its own row"
+    );
+    assert_eq!(rows.len(), 2, "one import each = two rows");
+}

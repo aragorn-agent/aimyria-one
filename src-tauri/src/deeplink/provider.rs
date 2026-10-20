@@ -99,31 +99,22 @@ pub async fn import_provider_from_deeplink(
     // Build provider configuration based on app type
     let mut provider = build_provider_from_request(&app_type, &merged_request)?;
 
-    // One relay means one row, so the id is stable rather than timestamped.
-    //
-    // Upstream minted `{name}-{timestamp}` because a user could import many
-    // providers and needed each to coexist. Here a re-import is a key rotation,
-    // not a second choice: a timestamped id would leave the previous row behind
-    // on every rotation, so the provider list would grow without bound and the
-    // user would have to guess which row is live.
-    let mut provider_id = crate::live_writer::PROVIDER_ID.to_string();
+    // The id depends on whose link this is, and the two cases genuinely differ.
+    // See `import_provider_id` for why.
+    let endpoint_text = merged_request.endpoint.as_deref().unwrap_or_default();
+    let points_at_us = points_at_our_relay(endpoint_text);
+    let mut provider_id = import_provider_id(endpoint_text, &name);
 
-    // Keep the id unique if some other row already claimed it. That can only
-    // happen for a link that does not point at us, so the user who sent it can
-    // keep their own name.
-    if merged_request
-        .endpoint
-        .as_deref()
-        .unwrap_or_default()
-        .contains(crate::commands::aimyria::RELAY_HOST)
+    // Our own row is being replaced, so drop the old one instead of accumulating
+    // rotations. Only for a link that points at us -- another relay's row is a
+    // different provider and must never delete ours.
+    if points_at_us
         && state
             .db
             .get_all_providers(app_type.as_str())
             .map(|all| all.contains_key(&provider_id))
             .unwrap_or(false)
     {
-        // Our own row is being replaced, so drop the old one instead of
-        // accumulating rotations.
         ProviderService::delete(state, app_type.clone(), &provider_id).ok();
     }
     provider.id = provider_id.clone();
@@ -199,6 +190,53 @@ pub async fn merge_group_models(
     Ok(merged)
 }
 
+/// Whether a link's endpoint points at one of *our* relays.
+///
+/// This is the whole basis for deciding whether an import replaces an existing
+/// row or adds a new one, so it lives on its own rather than inline.
+pub(crate) fn points_at_our_relay(endpoint: &str) -> bool {
+    endpoint.contains(crate::commands::aimyria::RELAY_HOST)
+        || endpoint.contains(crate::commands::aimyria::RELAY_ALT_HOST)
+}
+
+/// The provider id a deep-link import should write.
+///
+/// # The two cases
+///
+/// A link **to us** is a key rotation: the user has one account with us, and
+/// re-importing should replace the row rather than leave a trail of them, so the
+/// id is the stable [`crate::live_writer::PROVIDER_ID`]. The caller additionally
+/// deletes the previous row first.
+///
+/// A link **to someone else's relay** is a second provider, not a rotation. The
+/// old code wrote our fixed id for those too, so importing another relay silently
+/// overwrote our row -- the owner hit exactly this (a FlowNode import replaced
+/// Aimyria). A unique id per import is what makes repeated imports accumulate.
+/// Upstream minted `{name}-{timestamp}` for the same reason; the timestamp keeps
+/// the row recognisable in the list.
+///
+/// The slug is ASCII-only on purpose: ids travel into file paths and config keys
+/// on some clients, where an arbitrary display name is a liability.
+pub(crate) fn import_provider_id(endpoint: &str, name: &str) -> String {
+    if points_at_our_relay(endpoint) {
+        return crate::live_writer::PROVIDER_ID.to_string();
+    }
+
+    let slug: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect::<String>()
+        .trim_matches(['-', '_'])
+        .to_string();
+    let slug = if slug.is_empty() {
+        "provider".to_string()
+    } else {
+        slug
+    };
+    format!("{slug}-{}", chrono::Local::now().format("%Y%m%d%H%M%S"))
+}
+
 /// Build a Provider structure from a deep link request
 pub(crate) fn build_provider_from_request(
     app_type: &AppType,
@@ -231,6 +269,8 @@ pub(crate) fn build_provider_from_request(
             .claude_desktop_mode = Some(ClaudeDesktopMode::Direct);
     }
 
+    let endpoint_text = request.endpoint.clone().unwrap_or_default();
+
     if request.balance_url.is_some() || request.balance_token.is_some() {
         let meta = meta.get_or_insert_with(ProviderMeta::default);
         meta.balance_url = request.balance_url.clone();
@@ -246,7 +286,6 @@ pub(crate) fn build_provider_from_request(
         }
     }
 
-    let endpoint_text = request.endpoint.clone().unwrap_or_default();
     let icon = request.icon.clone().or_else(|| {
         if endpoint_text.contains("321ai.cc") {
             Some("321ai".to_string())

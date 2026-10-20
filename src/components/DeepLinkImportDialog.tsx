@@ -377,7 +377,7 @@ export function DeepLinkImportDialog() {
   return (
     <Dialog open={isOpen && !!request} onOpenChange={setIsOpen}>
       <DialogContent
-        className="sm:max-w-[560px] border-[#e9f1f9]/25 bg-[#0D0D0F] text-[#FFFFFF] shadow-[0_32px_90px_-24px_rgba(0,0,0,0.8)]"
+        className="sm:max-w-[560px] border-border-strong bg-surface text-fg-1 shadow-lg"
         zIndex="top"
       >
         {request && (
@@ -391,10 +391,10 @@ export function DeepLinkImportDialog() {
             {/* 主体内容整体右移，略大于标题内边距，让内容看起来不贴边 */}
             <div className="space-y-4 px-8 py-4 max-h-[60vh] overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar]:block [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-subtle">
               {request.resource === "provider" && targetApp ? (
-                <div className="rounded-panel border border-[#e9f1f9]/35 bg-[linear-gradient(135deg,rgba(233, 241, 249,0.16),rgba(233, 241, 249,0.03))] p-4">
+                <div className="rounded-panel border border-border-strong bg-subtle p-4">
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <div className="text-caption uppercase tracking-[0.18em] text-[#8fa9c4]">
+                      <div className="text-caption uppercase tracking-[0.18em] text-fg-3">
                         AimyriA go
                       </div>
                       <div className="mt-1 text-title text-fg-1">
@@ -404,24 +404,24 @@ export function DeepLinkImportDialog() {
                         {targetApp.subtitle} · {targetApp.protocol}
                       </div>
                     </div>
-                    <span className="rounded-full border border-[#e9f1f9]/40 px-2.5 py-1 text-badge text-[#8fa9c4]">
+                    <span className="rounded-full border border-border-strong px-2.5 py-1 text-badge text-fg-2">
                       {request.groupName || "Aimyria"}
                     </span>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <span className="rounded-full bg-surface/80 px-2.5 py-1 text-badge text-fg-2">
+                    <span className="rounded-full bg-surface px-2.5 py-1 text-badge text-fg-2">
                       密钥 {maskedApiKey}
                     </span>
                     {request.models?.length ? (
-                      <span className="rounded-full bg-surface/80 px-2.5 py-1 text-badge text-fg-2">
+                      <span className="rounded-full bg-surface px-2.5 py-1 text-badge text-fg-2">
                         {request.models.length} 个模型
                       </span>
                     ) : modelsLoading ? (
-                      <span className="rounded-full bg-surface/80 px-2.5 py-1 text-badge text-fg-2">
+                      <span className="rounded-full bg-surface px-2.5 py-1 text-badge text-fg-2">
                         正在读取模型…
                       </span>
                     ) : null}
-                    <span className="rounded-full bg-surface/80 px-2.5 py-1 text-badge text-fg-2">
+                    <span className="rounded-full bg-surface px-2.5 py-1 text-badge text-fg-2">
                       只写这一个应用
                     </span>
                   </div>
@@ -910,7 +910,7 @@ export function DeepLinkImportDialog() {
               <Button
                 onClick={handleImport}
                 disabled={isImporting}
-                className="bg-[#141413] font-semibold text-[#f7e5b7] hover:bg-[#2b2b2b]"
+                className="bg-action font-semibold text-action-fg hover:bg-action-hover"
               >
                 {isImporting ? t("deeplink.importing") : t("deeplink.import")}
               </Button>

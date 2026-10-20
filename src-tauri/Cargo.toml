@@ -15,7 +15,7 @@ name = "aimyria-one"
 # number and reports "already up to date" forever -- the exact failure this
 # version bump exists to escape. `scripts/check_version_sync.ps1` checks all
 # three.
-version = "1.0.4"
+version = "1.0.5"
 description = "AimyriA go - one-click configuration tool for AI coding CLIs"
 # Upstream author must be retained per MIT license.
 # Original: https://github.com/farion1231/cc-switch  (Copyright (c) 2025 Jason Young)

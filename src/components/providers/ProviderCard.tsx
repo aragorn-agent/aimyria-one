@@ -19,6 +19,7 @@ import { ProviderIconBox } from "@/components/ProviderIconBox";
 import { HoverTip } from "@/components/ui/hover-tip";
 import UsageFooter from "@/components/UsageFooter";
 import SubscriptionQuotaFooter from "@/components/SubscriptionQuotaFooter";
+import RelayBalanceFooter from "./RelayBalanceFooter";
 import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import XaiOauthQuotaFooter from "@/components/XaiOauthQuotaFooter";
@@ -228,15 +229,24 @@ export function ProviderCard({
   }, [provider.notes, displayUrl, fallbackUrlText]);
 
   const isBoundCodexOfficial = codexOfficialIdentity === "managed_account";
+  // Whether this row is one of *our* relay's rows. Its balance comes from the
+  // read-only bridge (`get_relay_balance`), which is the same source the
+  // 接入中心 page reads -- so the card routes it to `RelayBalanceFooter` instead
+  // of the generic usage-script path below.
+  //
+  // This used to be an exclusion (`!relayEndpoint`), and the cost was the owner's
+  // report: a third-party relay on the same screen showed "余额 9.93 USD" while
+  // ours showed nothing, which reads as "our relay has no balance" rather than
+  // "we do not draw it here".
   const relayEndpoint = /aimyria\.com/i.test(displayUrl ?? "");
+  const relayRow = relayEndpoint || !!provider.meta?.balanceUrl;
   const usageEnabled =
     (provider.meta?.usage_script?.enabled ?? isBoundCodexOfficial) &&
-    // A relay row with a read-only balance bridge reports its balance on the
-    // 接入中心 page. Running the old usage script as well only produced a
-    // misleading 404 on the card.
-    !provider.meta?.balanceUrl &&
-    // Same for legacy rows that still carry the broken /v1/usage script.
-    !relayEndpoint;
+    // The relay's own balance is drawn by RelayBalanceFooter, not by a usage
+    // script: running the old /v1/usage script here produced a misleading 404 on
+    // the card, which is why the exclusion was added in the first place. The
+    // exclusion stays; what changes is that the row now has its own footer.
+    !relayRow;
   const isOfficial = isOfficialProvider(provider, appId);
   const supportsOfficialSubscription =
     isOfficial && ["claude", "codex", "gemini", "grokbuild"].includes(appId);
@@ -477,6 +487,11 @@ export function ProviderCard({
                   inline={true}
                   isCurrent={isCurrent}
                 />
+              ) : relayRow ? (
+                // Our own relay: balance comes from the read-only bridge, the same
+                // source the 接入中心 page reads. Checked before `isOfficial` so a
+                // relay row that also looks official still shows its balance.
+                <RelayBalanceFooter isCurrent={isCurrent} />
               ) : isOfficial ? (
                 officialSubscriptionEnabled ? (
                   <SubscriptionQuotaFooter
