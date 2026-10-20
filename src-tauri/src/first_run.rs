@@ -127,10 +127,10 @@ const PROTOCOL_SCHEMES: [&str; 2] = ["aimyria", "ccswitch"];
 
 /// Make sure the OS knows about both URL schemes this app answers to.
 ///
-/// Idempotent: `reg add` overwrites. Windows-only by design — macOS and Linux
-/// use per-user desktop files that the installer owns, and we do not ship those
-/// platforms yet; writing a desktop file from the app would put install
-/// behaviour in two places.
+/// Idempotent: every value is overwritten in place. Windows-only by design —
+/// macOS and Linux use per-user desktop files that the installer owns, and we do
+/// not ship those platforms yet; writing a desktop file from the app would put
+/// install behaviour in two places.
 #[cfg(target_os = "windows")]
 fn register_protocol(_app: &AppHandle) -> Result<(), crate::error::AppError> {
     use crate::error::AppError;
@@ -158,76 +158,65 @@ fn register_protocol(_app: &AppHandle) -> Result<(), crate::error::AppError> {
 ///    button in their browser
 /// 3. the open command
 ///
-/// A failure here means deep links are simply gone, so it is logged with the
-/// command's own output rather than swallowed.
+/// A failure here means deep links are simply gone, so it is logged rather than
+/// swallowed.
+///
+/// # Why the registry API and not `reg add`
+///
+/// This runs on every launch, and each `reg add` is a child process. The app is
+/// built for the Windows GUI subsystem, and a GUI process that starts a console
+/// child without `CREATE_NO_WINDOW` gets a fresh console window allocated for
+/// it. With two schemes and three values per scheme that was **six console
+/// windows on every start** — precisely the "several windows flash when it
+/// opens" the owner reported. Writing through `winreg` keeps the whole job
+/// in-process: no child, no console, nothing on screen.
+///
+/// It also stores the command string verbatim. `reg add /d '"…exe" "%1"'` was
+/// measured dropping the surrounding quotes, which survives a path with no
+/// spaces and breaks one with them (`C:\Program Files\…`) — the same thing
+/// `scripts\restore_registration.ps1` works around.
 #[cfg(target_os = "windows")]
 fn register_one_scheme(scheme: &str, exe: &str) {
-    let base = format!(r"HKCU\Software\Classes\{scheme}");
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
 
-    // `add` is the subcommand and has to be the first argument. Without it reg
-    // reads the key name as a top-level parameter and rejects everything, which
-    // is exactly what happened the first time this was written.
-    let steps: [(&str, Vec<String>); 3] = [
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let base = format!(r"Software\Classes\{scheme}");
+
+    // (what it is, key path, value name, value). An empty value name is the key's
+    // default value — the one Explorer reads for the description and, under
+    // `shell\open\command`, the command it runs.
+    let steps: [(&str, String, &str, String); 3] = [
         (
             "协议",
-            vec![
-                "add".into(),
-                base.clone(),
-                "/ve".into(),
-                "/d".into(),
-                format!("URL:AimyriA go {scheme} Protocol"),
-                "/f".into(),
-            ],
+            base.clone(),
+            "",
+            format!("URL:AimyriA go {scheme} Protocol"),
         ),
         (
             "URL Protocol 标记",
-            vec![
-                "add".into(),
-                base.clone(),
-                "/v".into(),
-                "URL Protocol".into(),
-                "/t".into(),
-                "REG_SZ".into(),
-                // Empty on purpose: Windows only tests for the value's presence.
-                "/d".into(),
-                String::new(),
-                "/f".into(),
-            ],
+            base.clone(),
+            "URL Protocol",
+            // Empty on purpose: Windows only tests for the value's presence.
+            String::new(),
         ),
         (
             "打开命令",
-            vec![
-                "add".into(),
-                format!(r"{base}\shell\open\command"),
-                "/ve".into(),
-                "/d".into(),
-                format!("\"{exe}\" \"%1\""),
-                "/f".into(),
-            ],
+            format!(r"{base}\shell\open\command"),
+            "",
+            format!("\"{exe}\" \"%1\""),
         ),
     ];
 
-    for (label, args) in steps {
-        // Capture output rather than using `.status()`: a bare exit code says
-        // "it failed" but never why, and a silent failure here means deep links
-        // are simply gone with nothing in the log to act on.
-        match std::process::Command::new("reg").args(&args).output() {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let detail = if stderr.trim().is_empty() {
-                    stdout.trim()
-                } else {
-                    stderr.trim()
-                };
-                log::warn!(
-                    "注册 {scheme}:// {label} 失败（退出码 {:?}）：{}",
-                    out.status.code(),
-                    detail
-                );
-            }
-            Err(e) => log::warn!("调用 reg 注册 {scheme}:// {label} 失败: {e}"),
+    for (label, path, name, value) in steps {
+        // `create_subkey` both creates the key and opens it for writing, so each
+        // step stands on its own and their order does not matter.
+        match hkcu
+            .create_subkey(&path)
+            .and_then(|(key, _)| key.set_value(name, &value))
+        {
+            Ok(()) => {}
+            Err(e) => log::warn!("注册 {scheme}:// {label} 失败: {e}"),
         }
     }
 }
@@ -294,6 +283,30 @@ mod tests {
             state.db.get_setting(AUTOSTART_SKIPPED).unwrap().as_deref(),
             Some("1"),
             "the opt-out must be readable on the next launch",
+        );
+    }
+
+    /// This module must never start a child process.
+    ///
+    /// It runs on every launch, and the app is a Windows GUI binary: any console
+    /// child started from here without `CREATE_NO_WINDOW` gets its own console
+    /// window. That is exactly what shipped once — six `reg add` children, six
+    /// windows flashing on screen at every start. The registration goes through
+    /// the registry API precisely so there is nothing to hide.
+    ///
+    /// Written as a source scan rather than a runtime spy because the defect is
+    /// "a call site exists", not "a call site ran" — an early-return path would
+    /// make a runtime check pass while the next launch still flashes.
+    #[test]
+    fn the_module_never_spawns_a_child_process() {
+        // Assembled at runtime: a test that names the forbidden call in one
+        // literal would match itself and fail on its first run.
+        let forbidden = ["Command", "::new"].concat();
+        let source = include_str!("first_run.rs");
+        assert!(
+            !source.contains(&forbidden),
+            "first_run spawns a child process again; that is a console window on \
+             every launch — use the registry API instead",
         );
     }
 }
