@@ -24,6 +24,8 @@ use tauri_plugin_opener::OpenerExt;
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::Provider;
+use crate::services::profile::{ProfileScope, ProfileService};
+use crate::services::provider::ProviderService;
 use crate::services::usage_cache::UsageCache;
 use crate::store::AppState;
 
@@ -1107,6 +1109,11 @@ fn switch_feedback(app: &AppType, mode: TrayMode, name: String) -> Option<TrayFe
 
 /// 记下最近一次托盘操作的结果（覆盖上一条）。调用方随后会重建菜单。
 fn record_feedback(app: &tauri::AppHandle, feedback: TrayFeedback) {
+    *FEEDBACK.lock().unwrap() = Some(FeedbackRecord {
+        feedback,
+        at: std::time::Instant::now(),
+        seen: false,
+    });
     // Linux 没有悬停 / 点击事件，到点了自己重建一次把它拿掉。其它平台在悬停图标时就会重建，
     // 不在这里定时重建，免得把正开着的菜单关掉。
     #[cfg(target_os = "linux")]
@@ -2075,11 +2082,23 @@ pub fn refresh_tray_menu(app: &tauri::AppHandle) {
     }
 }
 
+/// 上一次重建菜单时看到的状态。用来判断这次是否值得重建：菜单没变就不动，
+/// 免得把用户正开着的菜单关掉（macOS 上重建菜单会关掉已打开的）。
+static LAST_MENU_STATUS: Lazy<Mutex<Option<MenuStatus>>> = Lazy::new(|| Mutex::new(None));
+
 /// 悬停到托盘图标时：问题区该出现 / 该消失了（路由服务停了、又起来了）、反馈行显示过了或到点了，
 /// 就重建菜单。只在变了时重建，菜单还没打开，不会被关掉。
 pub fn refresh_tray_if_problems_changed(app: &tauri::AppHandle) {
     static LAST_CHECK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    {}
+    // 悬停事件可以连续来（鼠标划过），10 秒内只比对一次就够。
+    {
+        let mut last = LAST_CHECK.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < MIN_TRAY_USAGE_REFRESH_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
     schedule_tray_status_check(app);
 }
 
@@ -2098,6 +2117,16 @@ fn refresh_tray_if_status_changed(app: &tauri::AppHandle) {
     let Ok((_, status)) = collect_status(state.inner(), &texts) else {
         return;
     };
+    // 状态没变就不重建：菜单里只有问题区 / 反馈行 / 「退出」文案会因为状态而变，
+    // 其余是随数据库走的，由各自的写入路径触发重建。
+    {
+        let mut last = LAST_MENU_STATUS.lock().unwrap();
+        if last.as_ref() == Some(&status) {
+            return;
+        }
+        *last = Some(status);
+    }
+    refresh_tray_menu(app);
 }
 
 // ─── 点击 ────────────────────────────────────────────────────────────────────
@@ -2197,6 +2226,301 @@ pub fn show_main_window(app: &tauri::AppHandle) {
         }
     }
 }
+// ─── 点击分发 ─────────────────────────────────────────────────────────────────
+//
+// 托盘每一项被点之后要做什么，全在这里。菜单是数据（`build_menu_model`），
+// 动作是这里的 `plan_menu_action`（也是纯函数，单测直接覆盖），中间那层
+// `handle_tray_menu_event` 只负责把 plan 执行掉。
+//
+// # 为什么拆成「plan + execute」
+//
+// 曾经只有 execute，且它什么都不做 —— `.on_menu_event(|app, event| {})` 是空的，
+// 于是**每一个**托盘条目点了都没反应，不只是「打开官网」。空处理器编译得过、
+// 也没有任何测试会失败，所以它能一直留在那里。
+//
+// 把「这个 id 属于哪种动作」抽成纯函数之后，「有没有入口」就成了一个可以断言的
+// 性质：`every_menu_id_plans_to_an_action` 遍历菜单里出现的每种 id，要求它能被
+// plan 到一个动作。菜单加一项而忘了接动作，测试会红，而不是安静地失效。
+
+/// 一个托盘条目的动作。
+#[derive(Debug, Clone, PartialEq)]
+enum MenuAction {
+    /// 打开并聚焦主窗口。
+    ShowMain,
+    /// 进入 / 退出轻量模式。
+    ToggleLightweight,
+    /// 打开官网。
+    OpenWebsite,
+    /// 退出应用（走 `app.exit`，触发退出清理）。
+    Quit,
+    /// 让主界面跳到某个页面 / 开始某个流程。
+    Navigate(TrayNavigation),
+    /// 切换某个应用的当前供应商。
+    SwitchProvider { app: AppType, provider_id: String },
+    /// 应用 / 取消某个分组下的项目（Profile）。
+    ApplyProfile {
+        scope: &'static str,
+        profile_id: Option<String>,
+    },
+}
+
+/// 菜单 id → 动作。`None` 只有一种来源：不可点的行（`label` / 子菜单容器）。
+///
+/// 判据必须覆盖 `build_menu_model` 生成的**每一种** id 前缀，否则就会出现
+/// 「菜单里有、点了没反应」——这正是本函数存在的理由。
+fn plan_menu_action(id: &str) -> Option<MenuAction> {
+    match id {
+        "show_main" => return Some(MenuAction::ShowMain),
+        "lightweight_mode" => return Some(MenuAction::ToggleLightweight),
+        "open_website" => return Some(MenuAction::OpenWebsite),
+        "quit" => return Some(MenuAction::Quit),
+        _ => {}
+    }
+
+    // 不可点的行：`info:*` 反馈 / 表头，以及 `submenu_*` 子菜单容器本身。
+    // 它们由 `TrayEntry::label` / `TrayEntry::Submenu` 生成，`enabled=false`。
+    if id.starts_with("info:") || id.starts_with("submenu_") {
+        return None;
+    }
+
+    // 项目：`profile_none_<scope>` 表示「不使用项目」，`profile_<scope>_<id>` 应用某个项目。
+    // 先于 provider 前缀判断，因为两者都以 `profile` 起头的是唯一形式。
+    if let Some(rest) = id.strip_prefix("profile_none_") {
+        return ProfileScope::parse(rest)
+            .ok()
+            .map(|scope| MenuAction::ApplyProfile {
+                scope: scope.as_str(),
+                profile_id: None,
+            });
+    }
+    if let Some(rest) = id.strip_prefix("profile_") {
+        // `<scope>_<id>`：scope 本身含连字符（如 `claude-desktop`），所以要按已知
+        // 分组名去匹配前缀，而不能简单地 split 一次。
+        for scope in ProfileScope::ALL {
+            let prefix = format!("{}_", scope.as_str());
+            if let Some(profile_id) = rest.strip_prefix(&prefix) {
+                if !profile_id.is_empty() {
+                    return Some(MenuAction::ApplyProfile {
+                        scope: scope.as_str(),
+                        profile_id: Some(profile_id.to_string()),
+                    });
+                }
+            }
+        }
+        return None;
+    }
+
+    // 供应商：`prov:<app>:<provider id>`。provider id 可以含 `:`，所以用 splitn(3)。
+    if let Some(rest) = id.strip_prefix("prov:") {
+        let mut parts = rest.splitn(2, ':');
+        let app = parts.next().and_then(|s| s.parse::<AppType>().ok());
+        let provider_id = parts.next().filter(|s| !s.is_empty());
+        return match (app, provider_id) {
+            (Some(app), Some(provider_id)) => Some(MenuAction::SwitchProvider {
+                app,
+                provider_id: provider_id.to_string(),
+            }),
+            _ => None,
+        };
+    }
+
+    // 导航：`nav:main` / `nav:settings:<分组>` / `nav:app:<应用>[:…]` /
+    // `nav:add:<应用>` / `nav:needs:<应用>:<供应商>`。尾部被忽略的那几种
+    // （`:quota` / `:service` / `:attach` / `:failed`）只是同一页面的不同说法。
+    if let Some(navigation) = parse_nav_id(id) {
+        return Some(MenuAction::Navigate(navigation));
+    }
+
+    None
+}
+
+/// 托盘菜单事件入口。`lib.rs` 的 `.on_menu_event` 直接调它。
+pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
+    let Some(action) = plan_menu_action(event_id) else {
+        // 不可点的行不会派发事件；真收到未知 id 说明菜单与分发器脱节了。
+        log::warn!("[Tray] 未处理的菜单事件: {event_id}");
+        return;
+    };
+    log::debug!("[Tray] 菜单事件 {event_id}");
+    execute_menu_action(app, action);
+}
+
+fn execute_menu_action(app: &tauri::AppHandle, action: MenuAction) {
+    match action {
+        MenuAction::ShowMain => show_main_window(app),
+        MenuAction::ToggleLightweight => {
+            let result = if crate::lightweight::is_lightweight_mode() {
+                crate::lightweight::exit_lightweight_mode(app)
+            } else {
+                crate::lightweight::enter_lightweight_mode(app)
+            };
+            if let Err(e) = result {
+                log::error!("[Tray] 轻量模式切换失败: {e}");
+            }
+        }
+        MenuAction::OpenWebsite => {
+            if let Err(e) = app.opener().open_url(WEBSITE_URL, None::<String>) {
+                log::error!("[Tray] 打开官网失败: {e}");
+            }
+        }
+        MenuAction::Quit => app.exit(0),
+        MenuAction::Navigate(navigation) => navigate(app, navigation),
+        MenuAction::SwitchProvider { app: app_type, provider_id } => {
+            handle_provider_click(app, app_type, &provider_id);
+        }
+        MenuAction::ApplyProfile { scope, profile_id } => {
+            apply_profile_from_tray(app, scope, profile_id.as_deref());
+        }
+    }
+}
+
+/// 产品的官网。托盘「打开官网」与 `product_info` 里那个 `website` 是同一个地址；
+/// 上游这里是 ccswitch.io，换成本站自己的。
+const WEBSITE_URL: &str = "https://aimyria.com";
+
+/// 让主界面去某个地方：先打开窗口，把导航存下来，再喊一声。
+///
+/// 存的这一步是必需的：轻量模式下窗口是新建的，`emit` 发出去时前端的
+/// `listen()` 还没挂上，事件会被丢掉（Tauri 事件无监听者即丢弃，日志里也不会有）。
+/// 前端挂载后会用 `take_tray_navigation` 把这条取走。
+fn navigate(app: &tauri::AppHandle, navigation: TrayNavigation) {
+    show_main_window(app);
+    // 空导航（`nav:main`）只是「打开界面」，没有要跳的地方，不值得惊动前端。
+    if navigation.is_empty() {
+        return;
+    }
+    *PENDING_NAVIGATION.lock().unwrap() = Some(navigation);
+    if let Err(e) = app.emit("tray-navigate", ()) {
+        log::error!("[Tray] 发射 tray-navigate 失败: {e}");
+    }
+}
+
+/// 托盘里点某家供应商。直连下这家需要路由 → 先弹「需要路由」对话框；否则直接切。
+fn handle_provider_click(app: &tauri::AppHandle, app_type: AppType, provider_id: &str) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let state = state.inner();
+
+    // 这家在这一层是否存在 —— 菜单是上一次重建的快照，数据可能已经变了。
+    let provider = match ProviderService::list(state, app_type.clone()) {
+        Ok(providers) => match providers.get(provider_id) {
+            Some(provider) => provider.clone(),
+            None => {
+                log::warn!(
+                    "[Tray] 切换失败：{} 下没有供应商 {provider_id}",
+                    app_type.as_str()
+                );
+                return;
+            }
+        },
+        Err(e) => {
+            log::warn!("[Tray] 读取供应商失败: {e}");
+            record_switch_failure(&app_type, e.to_string());
+            schedule_tray_status_check(app);
+            return;
+        }
+    };
+    let name = provider.name.clone();
+
+    // 直连下这家需要路由：先让用户去开路由，别直接切（切了也用不了）。
+    if !crate::mode::current::is_proxy(&app_type) && provider_needs_routing(&app_type, &provider) {
+        navigate(
+            app,
+            TrayNavigation {
+                app: Some(app_type.as_str().to_string()),
+                intent: Some("needsRoute".to_string()),
+                provider_id: Some(provider_id.to_string()),
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
+    match ProviderService::switch(state, app_type.clone(), provider_id) {
+        Ok(_) => {
+            clear_app_problems(&app_type);
+            if let Some(feedback) = switch_feedback(&app_type, TrayMode::Direct, name) {
+                record_feedback(app, feedback);
+            }
+            emit_switched(app, state, &app_type, provider_id);
+            schedule_tray_status_check(app);
+        }
+        Err(e) => {
+            log::warn!("[Tray] 切换 {} 到 {provider_id} 失败: {e}", app_type.as_str());
+            record_switch_failure(&app_type, e.to_string());
+            schedule_tray_status_check(app);
+        }
+    }
+}
+
+/// 切换成功后通知前端：当前供应商变了、这一家的路由开关可能也跟着变了。
+///
+/// payload 形状与 `commands::profile::emit_profile_apply_events` 一致 ——
+/// 前端 `src/lib/api/providers.ts` 的 `provider-switched` 监听依赖它。
+fn emit_switched(app: &tauri::AppHandle, state: &AppState, app_type: &AppType, provider_id: &str) {
+    let app_str = app_type.as_str();
+    let (_, auto_failover_enabled) = state.db.get_proxy_flags_sync(app_str);
+    let event_data = serde_json::json!({
+        "appType": app_str,
+        "proxyEnabled": crate::mode::current::is_proxy(app_type),
+        "autoFailoverEnabled": auto_failover_enabled,
+        "providerId": provider_id,
+    });
+    if let Err(e) = app.emit("provider-switched", event_data) {
+        log::error!("[Tray] 发射 provider-switched 失败: {e}");
+    }
+}
+
+/// 托盘里点项目：`profile_id` 为 `None` 表示「不使用项目」。
+fn apply_profile_from_tray(app: &tauri::AppHandle, scope: &str, profile_id: Option<&str>) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let state = state.inner();
+    let Ok(scope) = ProfileScope::parse(scope) else {
+        return;
+    };
+
+    let Some(profile_id) = profile_id else {
+        if let Err(e) = state.db.set_current_profile_id(scope.as_str(), None) {
+            log::warn!("[Tray] 取消项目失败: {e}");
+            return;
+        }
+        if let Err(e) = app.emit(
+            "profile-applied",
+            serde_json::json!({ "profileId": null, "scope": scope.as_str() }),
+        ) {
+            log::error!("[Tray] 发射 profile-applied 失败: {e}");
+        }
+        refresh_tray_menu(app);
+        return;
+    };
+
+    let desktop_was_mapping = crate::commands::profile::desktop_uses_mapping(state, scope);
+    match ProfileService::apply(state, profile_id, scope) {
+        Ok(_) => {
+            for app_type in scope.apps() {
+                clear_app_problems(app_type);
+            }
+            crate::commands::profile::emit_profile_apply_events(
+                app,
+                state,
+                profile_id,
+                scope,
+                desktop_was_mapping,
+            );
+        }
+        Err(e) => {
+            log::warn!("[Tray] 应用项目 {profile_id} 失败: {e}");
+            for app_type in scope.apps() {
+                record_switch_failure(app_type, e.to_string());
+            }
+            schedule_tray_status_check(app);
+        }
+    }
+}
+
 const MIN_TRAY_USAGE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 合并多次快速触发的"usage 标题软更新"：批量刷新期间多个 usage 命令
@@ -2251,5 +2575,140 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
         let app_type_str = app_type.as_str();
         // 只需当前 provider —— by-id 查询避免把整个 app 的 provider 列表加载
         // 进内存（每次悬停的热路径）。
+    }
+}
+
+#[cfg(test)]
+mod menu_action_tests {
+    use super::{plan_menu_action, MenuAction, ProfileScope, TRAY_APPS};
+    use crate::app_config::AppType;
+
+    /// 菜单能生成的**每一种**可点 id 都必须在 `plan_menu_action` 里有归宿。
+    ///
+    /// 这是本模块存在的理由。修复前 `on_menu_event` 是空处理器，于是菜单里每一项
+    /// 点了都没反应，而且没有任何测试会失败 —— 空处理器编译得过、菜单模型单测也
+    /// 照样绿（那些测试只断言「菜单里有什么」，不断言「点了会怎样」）。
+    /// 所以这里逐个 id 断言「有计划到的动作」，菜单新增一项却忘了接动作时测试会红。
+    ///
+    /// 这里的 id 是照着 `build_menu_model` 的生成处拼的，形状与真实菜单一致：
+    /// `provider_id_for` / `problem_id` / `app_entry` / `app_children` /
+    /// `profile_none_<scope>` / `profile_<scope>_<id>` / 顶层四项。
+    #[test]
+    fn every_clickable_id_plans_to_something() {
+        // 顶层四项。
+        for id in ["show_main", "lightweight_mode", "open_website", "quit"] {
+            assert!(
+                plan_menu_action(id).is_some(),
+                "{id} 是顶层菜单项，必须有计划到的动作"
+            );
+        }
+
+        // 问题区（`problem_id`）：服务未跑、某应用挂接失败 / 切换失败，以及溢出兜底。
+        for id in [
+            "nav:settings:routing",
+            &format!("nav:app:{}:attach", AppType::Claude.as_str()),
+            &format!("nav:app:{}:failed", AppType::Codex.as_str()),
+            "nav:main",
+        ] {
+            assert!(
+                matches!(plan_menu_action(id), Some(MenuAction::Navigate(_))),
+                "{id} 应解析成导航动作"
+            );
+        }
+
+        // 每个进托盘的应用下，所有会出现的导航 / 切换 / 项目 id。
+        for app in TRAY_APPS {
+            let a = app.as_str();
+            for id in [
+                format!("nav:app:{a}"),
+                format!("nav:app:{a}:quota"),
+                format!("nav:app:{a}:service"),
+                format!("nav:add:{a}"),
+                format!("nav:needs:{a}:some-provider"),
+            ] {
+                assert!(
+                    matches!(plan_menu_action(&id), Some(MenuAction::Navigate(_))),
+                    "{id} 应解析成导航动作"
+                );
+            }
+
+            // provider 切换项：id 里含 provider id，provider id 本身可能含 `:`。
+            assert!(matches!(
+                plan_menu_action(&format!("prov:{a}:some-provider")),
+                Some(MenuAction::SwitchProvider { .. })
+            ));
+            assert!(matches!(
+                plan_menu_action(&format!("prov:{a}:vendor:with:colons")),
+                Some(MenuAction::SwitchProvider { .. })
+            ));
+        }
+
+        // 项目：`claude-desktop` 这种带连字符的 scope 是容易被 split 一次而解析错的那种。
+        for scope in ProfileScope::ALL {
+            let s = scope.as_str();
+            for id in [format!("profile_none_{s}"), format!("profile_{s}_proj-1")] {
+                assert!(
+                    matches!(plan_menu_action(&id), Some(MenuAction::ApplyProfile { .. })),
+                    "{id} 应解析成应用项目动作"
+                );
+            }
+        }
+    }
+
+    /// 不可点的行必须计划成 `None`，不能被当成动作 —— 否则会把灰字变成按钮。
+    #[test]
+    fn non_clickable_rows_plan_to_nothing() {
+        for id in [
+            "info:feedback",
+            "info:claude:header",
+            "info:claude:failover",
+            "info:claude:blocked:some-provider",
+            "info:claude:projects",
+            "submenu_claude",
+        ] {
+            assert!(
+                plan_menu_action(id).is_none(),
+                "{id} 是不可点行 / 子菜单容器，不应有计划到的动作"
+            );
+        }
+    }
+
+    /// 每个 id 的解析结果要具体到正确的目标，不只是「非 None」。
+    ///
+    /// 「有计划到的动作」还不够：把 `profile_none_<scope>` 解析成 `profile_<scope>_<id>`
+    /// 也会通过上面那条断言，但点「不使用项目」会变成「应用项目 X」。
+    #[test]
+    fn ids_resolve_to_the_right_target() {
+        assert_eq!(
+            plan_menu_action("profile_none_claude-desktop"),
+            Some(MenuAction::ApplyProfile {
+                scope: "claude-desktop",
+                profile_id: None,
+            })
+        );
+        assert_eq!(
+            plan_menu_action("profile_claude-desktop_proj-1"),
+            Some(MenuAction::ApplyProfile {
+                scope: "claude-desktop",
+                profile_id: Some("proj-1".to_string()),
+            })
+        );
+        assert_eq!(
+            plan_menu_action("prov:claude-desktop:vendor:x"),
+            Some(MenuAction::SwitchProvider {
+                app: AppType::ClaudeDesktop,
+                provider_id: "vendor:x".to_string(),
+            })
+        );
+
+        // `nav:needs` 的第三个字段是 provider id，导航要带着它，前端才能定位到那一行。
+        match plan_menu_action("nav:needs:codex:vendor:x") {
+            Some(MenuAction::Navigate(nav)) => {
+                assert_eq!(nav.app.as_deref(), Some("codex"));
+                assert_eq!(nav.intent.as_deref(), Some("needsRoute"));
+                assert_eq!(nav.provider_id.as_deref(), Some("vendor:x"));
+            }
+            other => panic!("nav:needs 应解析成带着 provider 的导航，实为 {other:?}"),
+        }
     }
 }

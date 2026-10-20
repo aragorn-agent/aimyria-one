@@ -577,6 +577,11 @@ impl Database {
                         }
                         Self::set_user_version(conn, 20)?;
                     }
+                    20 => {
+                        log::info!("迁移数据库从 v20 到 v21（恢复官方账号卡片）");
+                        Self::migrate_v20_to_v21_rearm_official_seeds(conn)?;
+                        Self::set_user_version(conn, 21)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1623,6 +1628,56 @@ impl Database {
                 "last_tail_fingerprint",
                 "INTEGER",
             )?;
+        }
+        Ok(())
+    }
+
+    /// v20 → v21：把「官方账号卡片」重新交到已经装过旧版的用户手里。
+    ///
+    /// # 为什么必须有这一步，光恢复 seed 列表不够
+    ///
+    /// `OFFICIAL_SEEDS` 一度被清空，而 `init_default_official_providers` 会以
+    /// `official_providers_seeded` 这个 flag 记录「我已经播种过了」。清空期间它扫的是
+    /// **空列表**，却照样把 flag 置为 true —— 所以每一个装过那一版的库，flag 都是
+    /// true 而官方行从未存在。只把 seed 列表填回去，新装的机器会拿到官方卡片，
+    /// **存量机器一张也拿不到**（flag 短路，`init_default_official_providers` 直接返回 0）。
+    ///
+    /// 这正是「播种用一次性 flag」这类做法的经典失败模式：flag 记录的是「跑没跑过」，
+    /// 而这次表达的是「播种成没成功」—— 两者在列表为空时不一致。
+    ///
+    /// 所以这里只做一件事：清掉这个陈旧的 flag，让下一次
+    /// `init_default_official_providers` 按**现在非空的**列表重新播一遍。它本身是幂等的
+    /// （已存在的 id 会跳过），所以清 flag 不会覆盖用户改过的行。
+    fn migrate_v20_to_v21_rearm_official_seeds(conn: &Connection) -> Result<(), AppError> {
+        if !Self::table_exists(conn, "settings")? || !Self::table_exists(conn, "providers")? {
+            return Ok(());
+        }
+        // 只在「flag 已置但官方行确实缺失」时清 —— 已经有官方卡片的库不该被动，
+        // 用户可能正用着那张卡（比如 Codex 官方账号）。
+        let flag_on: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings WHERE key = 'official_providers_seeded')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let official_rows: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM providers WHERE category = 'official')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if flag_on && !official_rows {
+            conn.execute(
+                "DELETE FROM settings WHERE key = 'official_providers_seeded'",
+                [],
+            )
+            .map_err(|e| AppError::Database(format!("清除官方播种标记失败: {e}")))?;
+            log::info!(
+                "已清除陈旧的 official_providers_seeded 标记（当时播种的是空列表），\
+                 下次启动将按非空列表重播官方卡片"
+            );
         }
         Ok(())
     }
@@ -3835,6 +3890,84 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(values, (1, 1, 0));
+        Ok(())
+    }
+
+    /// The case this migration exists for: a machine that installed while the
+    /// seed list was empty. Its flag reads "already seeded" and its provider
+    /// table has no official row, so leaving the flag alone would mean the
+    /// restored seeds never reach it.
+    #[test]
+    fn migrate_v20_to_v21_rearms_seeding_when_official_rows_are_missing() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE providers (
+                id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                settings_config TEXT NOT NULL,
+                category TEXT,
+                PRIMARY KEY (id, app_type)
+             );
+             INSERT INTO settings (key, value) VALUES ('official_providers_seeded', 'true');
+             INSERT INTO providers (id, app_type, name, settings_config, category)
+                VALUES ('mine', 'claude', 'My Relay', '{}', 'custom');",
+        )?;
+        Database::set_user_version(&conn, 20)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        let flag: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = 'official_providers_seeded')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            !flag,
+            "the stale flag must be cleared so the non-empty seed list runs on next start"
+        );
+        // 用户自己的行必须原样保留 —— 这次迁移只碰那个 flag。
+        let mine: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM providers WHERE id = 'mine'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(mine, 1, "the user's own provider must be untouched");
+        Ok(())
+    }
+
+    /// A machine that already has its official cards must not be disturbed:
+    /// clearing the flag there would be pointless churn, and re-seeding could
+    /// surprise a user who is actively using one.
+    #[test]
+    fn migrate_v20_to_v21_leaves_a_seeded_machine_alone() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE providers (
+                id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                settings_config TEXT NOT NULL,
+                category TEXT,
+                PRIMARY KEY (id, app_type)
+             );
+             INSERT INTO settings (key, value) VALUES ('official_providers_seeded', 'true');
+             INSERT INTO providers (id, app_type, name, settings_config, category)
+                VALUES ('claude-official', 'claude', 'Claude Official', '{\"env\":{}}', 'official');",
+        )?;
+        Database::set_user_version(&conn, 20)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        let flag: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = 'official_providers_seeded')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(flag, "a machine that already has the cards keeps its flag");
         Ok(())
     }
 

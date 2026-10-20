@@ -35,7 +35,23 @@ export interface GeminiProviderPreset extends PresetFamilyFields {
 
 // No third-party relay presets: a preset is our recommendation, and this build
 // ships exactly one relay — Aimyria.
-export const geminiProviderPresets: GeminiProviderPreset[] = [];
+//
+// The official entry is the user's own Google account; empty `env` + `config`
+// lets the Gemini CLI use its own Google OAuth login rather than a key we ship.
+export const geminiOfficialPreset: GeminiProviderPreset = {
+  name: "Google Official",
+  websiteUrl: "https://ai.google.dev/",
+  apiKeyUrl: "https://aistudio.google.com/apikey",
+  settingsConfig: { env: {}, config: {} },
+  description: "Google 官方 Gemini API (OAuth)",
+  category: "official",
+  icon: "gemini",
+  iconColor: "#4285F4",
+};
+
+export const geminiProviderPresets: GeminiProviderPreset[] = [
+  geminiOfficialPreset,
+];
 
 export function getGeminiPresetByName(
   name: string,

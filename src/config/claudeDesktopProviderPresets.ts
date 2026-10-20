@@ -70,6 +70,21 @@ export interface ClaudeDesktopProviderPreset extends PresetFamilyFields {
  * 非 Claude 上游模型用此工厂：route ID 使用 Claude Desktop 能通过校验的
  * Sonnet/Opus/Haiku 路由，真实品牌名只写入 labelOverride 和 upstreamModel。
  *
- * 列表故意为空：预设是我们的推荐位，本产品只提供一个中转：Aimyria。
+ * 列表里只放官方条目：预设是我们的推荐位，本产品只提供一个中转：Aimyria。
  */
-export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [];
+export const claudeDesktopOfficialPreset: ClaudeDesktopProviderPreset = {
+  name: "Claude Desktop Official",
+  websiteUrl: "https://claude.ai/download",
+  category: "official",
+  // 空 baseUrl = 不写自定义网关；切换该项时后端会把 Desktop 恢复成 1P 模式，
+  // 走它自己登录的账号。
+  baseUrl: "",
+  mode: "direct",
+  apiFormat: "anthropic",
+  icon: "anthropic",
+  iconColor: "#D4915D",
+};
+
+export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [
+  claudeDesktopOfficialPreset,
+];

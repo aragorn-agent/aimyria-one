@@ -74,9 +74,22 @@ export interface ProviderPreset extends PresetFamilyFields {
   modelsUrl?: string;
 }
 
-// There are deliberately no third-party relay presets here.
+// No third-party relay presets: a preset is our recommendation, and this build
+// ships exactly one relay — Aimyria.
 //
-// A preset is our recommendation: it puts another gateway's name and logo one
-// click away inside our own product and invites price comparison against us.
-// This build ships exactly one relay — Aimyria — so the list is empty.
-export const providerPresets: ProviderPreset[] = [];
+// The official entry below is not a relay recommendation and is not a
+// competitor: it is the user's own Anthropic account, and it is the only way
+// back to it from inside this tool. Its `settingsConfig` is deliberately
+// `{env:{}}` — on switch, the projection clears the floor keys we wrote, so
+// Claude Code falls back to its own native credential store.
+export const claudeOfficialPreset: ProviderPreset = {
+  name: "Claude Official",
+  websiteUrl: "https://www.anthropic.com/claude-code",
+  settingsConfig: { env: {} },
+  isOfficial: true,
+  category: "official",
+  icon: "anthropic",
+  iconColor: "#D4915D",
+};
+
+export const providerPresets: ProviderPreset[] = [claudeOfficialPreset];

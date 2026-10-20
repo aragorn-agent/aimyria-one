@@ -591,7 +591,14 @@ const RULES = [
     },
   },
   {
-    rule: "No competitor presets are seeded",
+    rule: "No competitor relay presets are seeded",
+    why:
+      "The seeds may only name a vendor's own endpoint (Claude/OpenAI/Google/Grok), " +
+      "never a third-party relay. The official rows are the user's way back to their " +
+      "own subscription; a relay row would be us recommending a competitor inside our " +
+      "own product. Emptying the list is a product decision that must be explicit — " +
+      "it is not silently permitted, because an empty list makes every consumer of it " +
+      "dead (ensure_official_seed_by_id can only return 'unknown official seed').",
     check: () => {
       const seed = readFileSync(
         join(ROOT, "src-tauri/src/database/dao/providers_seed.rs"),
@@ -599,23 +606,55 @@ const RULES = [
       );
       const problems = [];
 
-      // The list must be empty. Matching on the binding is enough: a seed needs
-      // one, so any entry means upstream's list came back. The `;` terminator
-      // matters — without it the `[\s\S]*?` can run on into the next item.
+      // The binding must exist. An empty list is no longer a failure in itself —
+      // it is reported below only if it is empty while the ids are still
+      // referenced, because that combination is what leaves call sites dead.
       const list = seed.match(
-        /OFFICIAL_SEEDS\s*:\s*&\[OfficialProviderSeed\]\s*=\s*&\[([\s\S]*?)\]\s*;/,
+        /OFFICIAL_SEEDS\s*:\s*&\[OfficialProviderSeed\]\s*=\s*&\[([\s\S]*?)\];/,
       );
       if (!list) {
         problems.push("providers_seed.rs: OFFICIAL_SEEDS binding not found");
-      } else if (list[1].trim().length > 0) {
+        return problems;
+      }
+
+      const referencedIds = /CLAUDE_OFFICIAL_PROVIDER_ID|CODEX_OFFICIAL_PROVIDER_ID/.test(
+        readFileSync(join(ROOT, "src-tauri/src/database/mod.rs"), "utf8"),
+      );
+      if (list[1].trim().length === 0 && referencedIds) {
         problems.push(
-          `providers_seed.rs: ${list[1].trim().split(/\n/).length} seeded row(s) — a fresh database would ship other vendors`,
+          "providers_seed.rs: OFFICIAL_SEEDS is empty while official ids are still referenced — " +
+            "every consumer of the list is dead (this is how the 'switch back to your own account' " +
+            "feature disappeared silently)",
         );
       }
 
-      // And the membership test must not resurrect them.
-      if (/is_official_seed_id[\s\S]{0,200}?OFFICIAL_SEEDS\.iter\(\)\.any/.test(seed)) {
-        problems.push("providers_seed.rs: is_official_seed_id scans the list again");
+      // Every seeded row's website_url must be one of the vendor's own hosts.
+      const vendorHosts = [
+        "anthropic.com",
+        "claude.ai",
+        "claude.com",
+        "chatgpt.com",
+        "openai.com",
+        "ai.google.dev",
+        "google.com",
+        "x.ai",
+      ];
+      const urls = [...list[1].matchAll(/website_url:\s*"([^"]+)"/g)].map((m) => m[1]);
+      for (const url of urls) {
+        const host = url
+          .replace(/^https?:\/\//, "")
+          .split(/[/?#]/)[0]
+          .replace(/^www\./, "");
+        const own = vendorHosts.some((v) => host === v || host.endsWith(`.${v}`));
+        if (!own) {
+          problems.push(`providers_seed.rs: seeded website_url '${url}' is not a vendor's own host`);
+        }
+      }
+
+      // The membership test must actually scan the list, or official ids stop
+      // being recognised (migrations would rewrite user rows).
+      if (!/is_official_seed_id[\s\S]{0,200}?OFFICIAL_SEEDS\.iter\(\)\.any/.test(seed)) {
+        problems.push("providers_seed.rs: is_official_seed_id no longer scans OFFICIAL_SEEDS");
       }
       return problems;
     },

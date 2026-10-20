@@ -940,10 +940,73 @@ mod tests {
         });
     }
 
+    /// 切回自带的 Claude 账号：live 里我们写的那些键必须被清掉，CLI 才能回落它自己的登录态。
+    ///
+    /// 这是「切回自己的订阅账号」这个功能对用户的实际含义 —— 卡片存在不等于功能可用，
+    /// 必须真的把配置改回去。种子行是空 `env`，所以投影应当清掉中转键而不是写入别的值。
     #[test]
     #[serial]
-    fn update_keeps_official_provider_id_when_binding_and_unbinding() {
+    fn switching_to_the_seeded_claude_official_card_clears_our_relay_keys() {
         with_test_home(|state, _| {
+            crate::settings::reload_settings().expect("reload settings");
+            state
+                .db
+                .init_default_official_providers()
+                .expect("seed official providers");
+
+            // 先切到我们自己：live 里会出现中转地址和 token。
+            let ours = Provider::with_id(
+                "aimyria".into(),
+                "Aimyria".into(),
+                json!({ "env": {
+                    "ANTHROPIC_BASE_URL": "https://aimyria.com",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-test-token"
+                }}),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Claude.as_str(), &ours)
+                .expect("save our provider");
+            ProviderService::switch(state, AppType::Claude, "aimyria").expect("switch to ours");
+
+            let live: Value = read_json_file(&get_claude_settings_path()).expect("read live");
+            assert_eq!(
+                live["env"]["ANTHROPIC_BASE_URL"],
+                json!("https://aimyria.com"),
+                "precondition: our endpoint is written"
+            );
+
+            // 再切回官方：空 seed 的投影应当把中转键清掉，而不是留下我们那一版。
+            ProviderService::switch(state, AppType::Claude, crate::database::CLAUDE_OFFICIAL_PROVIDER_ID)
+                .expect("switch back to the official card");
+
+            let live: Value = read_json_file(&get_claude_settings_path()).expect("read live");
+            let env = live["env"].as_object().cloned().unwrap_or_default();
+            assert_ne!(
+                env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str),
+                Some("https://aimyria.com"),
+                "switching to the official card must not leave our relay endpoint in place"
+            );
+            assert!(
+                env.get("ANTHROPIC_AUTH_TOKEN")
+                    .map(|v| v.as_str().map(str::is_empty).unwrap_or(false))
+                    .unwrap_or(true),
+                "our token must not survive the switch back to the user's own account"
+            );
+
+            // 指针也要落在官方那一行上。
+            let current = state
+                .db
+                .get_current_provider(AppType::Claude.as_str())
+                .expect("read current");
+            assert_eq!(current.as_deref(), Some(crate::database::CLAUDE_OFFICIAL_PROVIDER_ID));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_keeps_official_provider_id_when_binding_and_unbinding() {        with_test_home(|state, _| {
             crate::settings::reload_settings().expect("reload settings");
             tauri::async_runtime::block_on(async {
                 state

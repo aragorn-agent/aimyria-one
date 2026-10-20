@@ -93,4 +93,19 @@ requires_openai_auth = ${requiresOpenAiAuth}`;
 
 // No third-party relay presets: a preset is our recommendation, and this build
 // ships exactly one relay — Aimyria.
-export const codexProviderPresets: CodexProviderPreset[] = [];
+//
+// The official entry is the user's own OpenAI/ChatGPT account. Empty `auth` plus
+// an empty `config` is the point: switching to it writes the official TOML back
+// and leaves `auth.json` to the native ChatGPT Plus/Pro OAuth login.
+export const codexOfficialPreset: CodexProviderPreset = {
+  name: "OpenAI Official",
+  websiteUrl: "https://chatgpt.com/codex",
+  isOfficial: true,
+  category: "official",
+  auth: {},
+  config: "",
+  icon: "openai",
+  iconColor: "#00A67E",
+};
+
+export const codexProviderPresets: CodexProviderPreset[] = [codexOfficialPreset];

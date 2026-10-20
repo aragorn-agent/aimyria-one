@@ -1102,6 +1102,7 @@ pub fn run() {
                 })
                 .menu(&menu)
                 .on_menu_event(|app, event| {
+                    crate::tray::handle_tray_menu_event(app, event.id().as_ref());
                 })
                 .show_menu_on_left_click(cfg!(not(target_os = "windows")));
 

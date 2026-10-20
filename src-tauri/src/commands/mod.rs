@@ -20,7 +20,7 @@ mod omo;
 mod openclaw;
 mod pi;
 mod plugin;
-mod profile;
+pub mod profile;
 mod prompt;
 mod provider;
 mod proxy;

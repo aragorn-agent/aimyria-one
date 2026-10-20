@@ -1010,4 +1010,44 @@ mod ensure_official_seed_tests {
             db.ensure_official_seed_by_id(CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, AppType::Claude);
         assert!(result.is_err(), "(id, app_type) mismatch should be Err");
     }
+
+    /// 播种把「已播种」的 flag 置上，于是第二次调用不会再插 —— 这正是
+    /// 「列表为空时 flag 照样被置上」那个缺陷造成存量机器拿不到官方卡的原因。
+    /// 这里把该行为钉住，好让 migration 的必要性有据可依。
+    #[test]
+    fn seeding_is_gated_by_the_flag_after_the_first_run() {
+        let db = Database::memory().expect("memory db");
+        let first = db.init_default_official_providers().expect("first seed");
+        assert!(first > 0, "first run must actually insert the official cards");
+        let second = db.init_default_official_providers().expect("second seed");
+        assert_eq!(second, 0, "second run must be a no-op (flag short-circuits)");
+    }
+
+    /// 一次播种要把**每个** app 的官方卡都放进去 —— 用户点「切回自己的账号」
+    /// 是按 app 来的，缺了哪一个，那个 app 就没有回头的入口。
+    #[test]
+    fn seeding_covers_every_app_with_an_official_card() {
+        let db = Database::memory().expect("memory db");
+        db.init_default_official_providers().expect("seed");
+
+        for (id, app_type) in [
+            (CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, AppType::ClaudeDesktop),
+            (CODEX_OFFICIAL_PROVIDER_ID, AppType::Codex),
+            (GROKBUILD_OFFICIAL_PROVIDER_ID, AppType::GrokBuild),
+        ] {
+            let provider = db
+                .get_provider_by_id(id, app_type.as_str())
+                .expect("query ok")
+                .unwrap_or_else(|| panic!("{id} must be seeded for {}", app_type.as_str()));
+            assert_eq!(provider.category.as_deref(), Some("official"));
+            // 空凭据是功能的一部分：切换时清掉我们写的，回落客户端自带登录。
+            assert!(
+                provider.settings_config["env"]
+                    .as_object()
+                    .map(|env| env.is_empty())
+                    .unwrap_or(true),
+                "{id} 不应带真实凭据"
+            );
+        }
+    }
 }
