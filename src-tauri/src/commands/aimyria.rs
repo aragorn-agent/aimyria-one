@@ -1,4 +1,4 @@
-//! AimyriA go's product API — the commands the minimal UI actually calls.
+//! AIMYRIA GO's product API — the commands the minimal UI actually calls.
 //!
 //! # Why this module exists
 //!
@@ -120,9 +120,9 @@ pub struct ProductInfo {
 #[tauri::command]
 pub fn product_info() -> ProductInfo {
     ProductInfo {
-        name: "AimyriA go".to_string(),
+        name: "AIMYRIA GO".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        website: "https://aimyria.com".to_string(),
+        website: "https://aimyria.com/go/".to_string(),
         docs: "https://aimyria.com/tutorial".to_string(),
         support: "https://aimyria.com/".to_string(),
         license: "MIT".to_string(),
@@ -463,7 +463,13 @@ pub fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
 /// Prefers Claude Code's row, then Codex's: those are the two clients whose row
 /// shape puts the key somewhere unambiguous. Returns `None` when no row is
 /// selected yet, which is the state before the first deep-link import.
-fn bound_credentials(state: &AppState) -> Option<(String, String, Option<String>, Option<String>)> {
+///
+/// WorkBuddy and DeepSeek Harness are ours alone and have no provider row — a
+/// user who imported into either of them used to read as "not bound" and lost
+/// the balance panel entirely. Those two are therefore read from the config
+/// file they were actually written to, which is the same evidence
+/// [`client_configured`] already trusts for its green marker.
+pub fn bound_credentials(state: &AppState) -> Option<(String, String, Option<String>, Option<String>)> {
     let mut fallback = None;
     for app_type in [AppType::Claude, AppType::Codex] {
         let Some(row) = selected_provider(state, &app_type) else {
@@ -491,7 +497,99 @@ fn bound_credentials(state: &AppState) -> Option<(String, String, Option<String>
             fallback = Some((base_url, api_key, balance_url, balance_token));
         }
     }
-    fallback
+    fallback.or_else(aimyria_only_credentials)
+}
+
+/// Credentials read back out of the WorkBuddy / DeepSeek Harness config files.
+///
+/// These clients are written directly, with no provider row to carry the key,
+/// so the only truthful source is the file itself. Reading it also means the
+/// panel keeps agreeing with the tray marker: if that file no longer points at
+/// us, `client_configured` says so and this returns `None` for the same reason.
+fn aimyria_only_credentials() -> Option<(String, String, Option<String>, Option<String>)> {
+    use crate::aimyria_apps::AimyriaOnlyApp;
+
+    // WorkBuddy first: its file holds the key in a plain field.
+    if let Ok(text) = std::fs::read_to_string(AimyriaOnlyApp::WorkBuddy.live_path()) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some((endpoint, key)) = workbuddy_credentials(&json) {
+                return Some((endpoint, key, None, None));
+            }
+        }
+    }
+
+    // DeepSeek Harness keeps the key in a sibling credentials file and the
+    // endpoint in the profile patch, so both halves are needed.
+    let patch = std::fs::read_to_string(AimyriaOnlyApp::DeepSeekHarness.live_path()).ok()?;
+    let endpoint = dsh_endpoint(&patch)?;
+    let key = dsh_api_key().filter(|k| !k.trim().is_empty())?;
+    Some((endpoint, key, None, None))
+}
+
+fn workbuddy_credentials(file: &serde_json::Value) -> Option<(String, String)> {
+    let entries = file
+        .as_array()
+        .cloned()
+        .or_else(|| file.get("models").and_then(|v| v.as_array()).cloned())?;
+    for entry in entries {
+        if entry.get("id").and_then(|v| v.as_str()) != Some(crate::aimyria_apps::PROVIDER_KEY) {
+            continue;
+        }
+        let endpoint = entry.get("url").and_then(|v| v.as_str())?.trim();
+        let key = entry.get("apiKey").and_then(|v| v.as_str())?.trim();
+        if !endpoint.is_empty() && !key.is_empty() {
+            return Some((endpoint.to_string(), key.to_string()));
+        }
+    }
+    None
+}
+
+fn dsh_endpoint(patch: &str) -> Option<String> {
+    let mut in_ours = false;
+    for line in patch.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 0 && trimmed.starts_with(&format!("{}:", crate::aimyria_apps::PROVIDER_KEY)) {
+            in_ours = true;
+            continue;
+        }
+        if in_ours && indent == 0 {
+            break;
+        }
+        if in_ours {
+            if let Some(rest) = trimmed.strip_prefix("baseURL:") {
+                let value = rest.trim().trim_matches('"').trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn dsh_api_key() -> Option<String> {
+    let home = std::env::var_os("DSH_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".dsh")))?;
+    // The profile patch lives under `profiles/<name>/`, so look next to every
+    // profile rather than guessing which one the import chose.
+    let profiles = std::fs::read_dir(home.join("profiles")).ok()?;
+    for entry in profiles.flatten() {
+        let path = entry.path().join(".credentials.yaml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("AIMYRIA_API_KEY:") {
+                let value = rest.trim().trim_matches('"').trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn selected_provider(state: &AppState, app_type: &AppType) -> Option<crate::provider::Provider> {

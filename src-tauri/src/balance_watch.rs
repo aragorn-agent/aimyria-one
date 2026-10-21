@@ -144,28 +144,14 @@ pub async fn check_once(app: &AppHandle) {
     }
 }
 
-/// The relay credentials the bound provider row carries.
+/// The relay credentials the bound client carries.
+///
+/// Delegated rather than reimplemented: the window's balance panel and this
+/// watcher must agree on what "bound" means, and the earlier local copy only
+/// scanned Claude/Codex rows — so a user who imported into WorkBuddy or
+/// DeepSeek Harness was never warned about a low balance at all.
 fn bound_credentials(state: &AppState) -> Option<(String, String)> {
-    for app_type in [AppType::Claude, AppType::Codex] {
-        let Some(row) = selected_provider(state, &app_type) else {
-            continue;
-        };
-        let (base_url, api_key) = row.resolve_usage_credentials(&app_type);
-        if !api_key.trim().is_empty() {
-            return Some((base_url, api_key));
-        }
-    }
-    None
-}
-
-fn selected_provider(state: &AppState, app_type: &AppType) -> Option<crate::provider::Provider> {
-    let id = crate::settings::get_current_provider(app_type)?;
-    state
-        .db
-        .get_all_providers(app_type.as_str())
-        .ok()?
-        .get(&id)
-        .cloned()
+    aimyria::bound_credentials(state).map(|(base_url, api_key, _, _)| (base_url, api_key))
 }
 
 #[cfg(test)]
@@ -205,10 +191,27 @@ mod tests {
     fn a_recharge_arms_the_next_warning() {
         // low -> topped up -> low again must warn again, or a user who tops up
         // once would never hear about the next time they run out.
-        assert!(should_warn(0.5, true), "staying low does not re-warn");
-        // Once the balance recovers the state clears...
-        assert!(!should_warn(10.0, true), "a healthy balance does not warn");
-        // ...so dropping below the threshold warns again.
-        assert!(should_warn(0.5, false));
+        //
+        // Driven through the same swap `check_once` uses rather than through
+        // `should_warn` alone: the property is about the remembered state
+        // *across* polls, and the helper cannot show that it was cleared.
+        fn poll(remaining: f64, was_below: &mut bool) -> bool {
+            let below = remaining < LOW_BALANCE_USD;
+            let prev = std::mem::replace(was_below, below);
+            below && !prev
+        }
+
+        let mut was_below = false;
+
+        // First reading is already low: warn, exactly once.
+        assert!(poll(0.5, &mut was_below), "an initial low must warn");
+        assert!(!poll(0.4, &mut was_below), "staying low does not re-warn");
+
+        // Topped up past the threshold: the state must clear...
+        assert!(!poll(10.0, &mut was_below), "a healthy balance never warns");
+        assert!(!was_below, "the low state must be forgotten on recovery");
+
+        // ...so dropping below again warns again.
+        assert!(poll(0.5, &mut was_below), "a second crossing warns again");
     }
 }

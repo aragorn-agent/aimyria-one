@@ -36,7 +36,7 @@ import { useTauriEvent } from "@/hooks/useTauriEvent";
 
 const LOW_BALANCE_USD = 2;
 const CONSOLE_URL = "https://aimyria.com/keys";
-const SITE_URL = "https://aimyria.com";
+const SITE_URL = "https://aimyria.com/go/";
 
 const QUICKSTART_ICON: Record<string, string | undefined> = {
   claude: "claude",
@@ -179,7 +179,7 @@ export function Quickstart() {
               onClick={() => void openExternal(SITE_URL)}
               className="text-caption text-fg-3 transition-colors hover:text-fg-1"
             >
-              aimyria.com ↗
+              产品页 ↗
             </button>
           </div>
 

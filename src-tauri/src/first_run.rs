@@ -66,6 +66,10 @@ pub fn maybe_run(app: &AppHandle) {
         log::warn!("注册 aimyria:// 失败，深链将不可用: {e}");
     }
 
+    // 产品改名过一次，自启项的值名也跟着换了。先迁移再判断，否则老机器上
+    // 会出现"旧名还在、新名也写"的两条自启（登录时起两个进程）。
+    crate::auto_launch::migrate_legacy_autostart();
+
     reassert_autostart(app);
 }
 
@@ -87,9 +91,19 @@ fn reassert_autostart(app: &AppHandle) {
 ///
 /// The opt-out check is what makes the default defensible: it is consulted on
 /// every launch, not only the first, so turning the switch off is permanent.
+///
+/// On an opt-out this *removes* the Run value rather than merely leaving it
+/// alone. The installer now writes that value itself (so deep links work even if
+/// the program never starts), and a reinstall must not resurrect autostart that
+/// the user had already turned off. Removing is also what repairs a machine left
+/// with a stale value by an older build: the value names a binary, and this is
+/// the only code that knows which binary that should be.
 fn seed_autostart(db: &crate::database::Database) -> Result<(), crate::error::AppError> {
     if db.get_setting(AUTOSTART_SKIPPED)?.is_some() {
-        log::info!("用户已关闭开机自启，不再自动开启");
+        if crate::auto_launch::is_auto_launch_enabled().unwrap_or(false) {
+            crate::auto_launch::disable_auto_launch()?;
+            log::info!("用户已关闭开机自启，移除安装器写入的自启项");
+        }
         return Ok(());
     }
 
@@ -191,7 +205,7 @@ fn register_one_scheme(scheme: &str, exe: &str) {
             "协议",
             base.clone(),
             "",
-            format!("URL:AimyriA go {scheme} Protocol"),
+            format!("URL:AIMYRIA GO {scheme} Protocol"),
         ),
         (
             "URL Protocol 标记",

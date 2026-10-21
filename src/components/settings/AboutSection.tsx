@@ -237,7 +237,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
           type="button"
           variant="neutral"
           size="compact"
-          onClick={() => open(info?.website ?? "https://aimyria.com")}
+          onClick={() => open(info?.website ?? "https://aimyria.com/go/")}
         >
           <Globe className="h-3.5 w-3.5" />
           {t("settings.officialWebsite")}
@@ -282,7 +282,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
         <span className="text-fg-3">·</span>
         <span className="inline-flex items-center gap-1">
           <ExternalLink className="h-3 w-3" />
-          {info?.website ?? "aimyria.com"}
+          {info?.website ?? "aimyria.com/go/"}
         </span>
       </div>
     </div>

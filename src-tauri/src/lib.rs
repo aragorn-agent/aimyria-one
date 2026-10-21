@@ -1,4 +1,9 @@
-mod aimyria_apps;
+// Public for the acceptance test that runs the shipping writers over copies of
+// the real WorkBuddy/dsh configs (tests/acceptance_real_configs.rs). The module is
+// only reachable from outside the crate under cfg(test), so the release binary
+// exposes nothing extra.
+#[cfg_attr(test, allow(unused_imports))]
+pub mod aimyria_apps;
 mod app_config;
 mod app_store;
 mod auto_launch;
@@ -572,7 +577,7 @@ pub fn run() {
 
                 // 用户配置存在数据库中，数据库尚未打开时使用保守的 Info 级别。
                 log::set_max_level(log::LevelFilter::Info);
-                log::info!("=== AimyriA go v{} started ===", env!("CARGO_PKG_VERSION"));
+                log::info!("=== AIMYRIA GO v{} started ===", env!("CARGO_PKG_VERSION"));
             }
 
             // 静默自更新：启动 60 秒后首次检查，此后每 6 小时一次。
@@ -1065,7 +1070,7 @@ pub fn run() {
 
             // 构建托盘
             let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
-                .tooltip("AimyriA go") // 鼠标悬停提示
+                .tooltip("AIMYRIA GO") // 鼠标悬停提示
                 .on_tray_icon_event(|tray, event| {
                     // Windows 的习惯是左键打开应用、右键出菜单（按平台给默认值，不加开关）；
                     // macOS 左键仍出菜单；Linux（AppIndicator）不派发点击事件，只能出菜单。
@@ -1276,7 +1281,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            // ── AimyriA go's product API ──────────────────────────────
+            // ── AIMYRIA GO's product API ──────────────────────────────
             commands::product_info,
             commands::get_client_status,
             commands::configure_all,
@@ -1960,7 +1965,7 @@ fn show_migration_error_dialog(app: &tauri::AppHandle, error: &str) -> bool {
         format!(
             "从旧版本迁移配置时发生错误：\n\n{error}\n\n\
             您的数据尚未丢失，旧配置文件仍然保留。\n\
-            建议回退到旧版本 AimyriA go 以保护数据。\n\n\
+            建议回退到旧版本 AIMYRIA GO 以保护数据。\n\n\
             点击「重试」重新尝试迁移\n\
             点击「退出」关闭程序（可回退版本后重新打开）"
         )
@@ -1968,7 +1973,7 @@ fn show_migration_error_dialog(app: &tauri::AppHandle, error: &str) -> bool {
         format!(
             "An error occurred while migrating configuration:\n\n{error}\n\n\
             Your data is NOT lost - the old config file is still preserved.\n\
-            Consider rolling back to an older AimyriA go version.\n\n\
+            Consider rolling back to an older AIMYRIA GO version.\n\n\
             Click 'Retry' to attempt migration again\n\
             Click 'Exit' to close the program"
         )
@@ -2033,7 +2038,7 @@ fn show_database_init_error_dialog(
             Common causes include: newer database version, corrupted file, permission issues, or low disk space.\n\n\
             Suggestions:\n\
             1) Back up the entire config directory (including aimyria-one.db)\n\
-            2) If you see “database version is newer”, please upgrade AimyriA go\n\
+            2) If you see “database version is newer”, please upgrade AIMYRIA GO\n\
             3) If this happened right after upgrading, consider rolling back to export/backup then upgrade again\n\n\
             Click 'Retry' to attempt initialization again\n\
             Click 'Exit' to close the program",

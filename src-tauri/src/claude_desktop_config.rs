@@ -1331,12 +1331,46 @@ fn windows_local_app_data_dir() -> PathBuf {
         .unwrap_or_else(|| get_home_dir().join("AppData").join("Local"))
 }
 
+/// `%APPDATA%` — the Roaming directory Claude Desktop's 1P install uses.
+///
+/// On Windows the 1P (`deploymentMode: "1p"`) user data lives in **Roaming**, not
+/// Local. Claude Desktop's own bundle derives it from `process.env.APPDATA`
+/// (the `eu` / `$ze` helpers in the 2.31226.0 `app.asar`), and a real Squirrel
+/// install keeps `claude_desktop_config.json` in `%APPDATA%\Claude`.
+///
+/// This module used to look for the 1P directory only under `%LOCALAPPDATA%`.
+/// On a normal install that directory contains nothing but `logs/`, so the 1P
+/// `deploymentMode` was written to a file Desktop never reads — the write
+/// succeeded, the client stayed on 1P, and the import looked like it had worked.
+#[cfg(windows)]
+fn windows_roaming_app_data_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| get_home_dir().join("AppData").join("Roaming"))
+}
+
 #[cfg(windows)]
 fn windows_paths_from_local_app_data(local_app_data: &Path) -> ClaudeDesktopPaths {
-    let normal_dir = pick_windows_claude_dir(local_app_data, false)
-        .unwrap_or_else(|| local_app_data.join("Claude"));
-    let threep_dir = pick_windows_claude_dir(local_app_data, true)
-        .unwrap_or_else(|| local_app_data.join("Claude-3p"));
+    windows_paths_from_roots(&windows_roaming_app_data_dir(), local_app_data)
+}
+
+/// Resolve both Claude Desktop data roots.
+///
+/// `roaming` holds the 1P install (`…\Roaming\Claude`); `local` holds the 3P
+/// install Claude creates for a gateway deployment (`…\Local\Claude-3p`).
+///
+/// Roaming is preferred for 1P and Local for 3P, but each falls back to the other
+/// root: installs move between them (Squirrel vs MSIX place user data
+/// differently), and an earlier build of this tool wrote a 1P file under Local.
+/// That leftover has to stay reachable so it can be read and restored to `1p`.
+#[cfg(windows)]
+fn windows_paths_from_roots(roaming: &Path, local: &Path) -> ClaudeDesktopPaths {
+    let normal_dir = pick_windows_claude_dir(roaming, false)
+        .or_else(|| pick_windows_claude_dir(local, false))
+        .unwrap_or_else(|| roaming.join("Claude"));
+    let threep_dir = pick_windows_claude_dir(local, true)
+        .or_else(|| pick_windows_claude_dir(roaming, true))
+        .unwrap_or_else(|| local.join("Claude-3p"));
     paths_from_dirs(normal_dir, threep_dir)
 }
 
@@ -1412,6 +1446,70 @@ mod tests {
         );
         paths.device = DeviceStore::at(home.join(".cc-switch"));
         paths
+    }
+
+    /// The 1P file Claude Desktop actually reads on Windows is the one in
+    /// **Roaming**. Writing it under Local produced a file the app never opened:
+    /// `%LOCALAPPDATA%\Claude` on a real install holds only `logs/`, while
+    /// `claude_desktop_config.json` lives in `%APPDATA%\Claude`.
+    #[cfg(all(windows, test))]
+    #[test]
+    fn windows_1p_config_is_read_from_roaming_not_local() {
+        let temp = TempDir::new().expect("tempdir");
+        let roaming = temp.path().join("Roaming");
+        let local = temp.path().join("Local");
+        std::fs::create_dir_all(roaming.join("Claude")).unwrap();
+        std::fs::create_dir_all(local.join("Claude")).unwrap();
+
+        let paths = windows_paths_from_roots(&roaming, &local);
+
+        assert_eq!(
+            paths.normal_config_path,
+            roaming.join("Claude").join(CONFIG_FILE),
+            "1P config must be the Roaming file"
+        );
+        assert_eq!(
+            paths.threep_config_path,
+            local.join("Claude-3p").join(CONFIG_FILE),
+            "3P config stays under Local"
+        );
+        assert_eq!(
+            paths.config_library_path,
+            local.join("Claude-3p").join(CONFIG_LIBRARY_DIR)
+        );
+    }
+
+    /// An install from the version that wrote to Local must still be readable,
+    /// so the leftover file can be restored to `1p` instead of being orphaned.
+    #[cfg(all(windows, test))]
+    #[test]
+    fn windows_falls_back_to_a_local_1p_directory_when_roaming_has_none() {
+        let temp = TempDir::new().expect("tempdir");
+        let roaming = temp.path().join("Roaming");
+        let local = temp.path().join("Local");
+        std::fs::create_dir_all(&roaming).unwrap();
+        std::fs::create_dir_all(local.join("Claude")).unwrap();
+
+        let paths = windows_paths_from_roots(&roaming, &local);
+
+        assert_eq!(
+            paths.normal_config_path,
+            local.join("Claude").join(CONFIG_FILE)
+        );
+    }
+
+    /// With neither directory present, the default is Roaming: that is where a
+    /// fresh install will create it, so the first write lands in the right place.
+    #[cfg(all(windows, test))]
+    #[test]
+    fn windows_defaults_the_1p_path_to_roaming() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths =
+            windows_paths_from_roots(&temp.path().join("Roaming"), &temp.path().join("Local"));
+        assert_eq!(
+            paths.normal_config_path,
+            temp.path().join("Roaming").join("Claude").join(CONFIG_FILE)
+        );
     }
 
     #[cfg(any(target_os = "linux", all(test, unix)))]

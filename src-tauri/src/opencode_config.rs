@@ -512,7 +512,7 @@ pub fn validate_native_provider(id: &str, value: &Value) -> Result<(), AppError>
 ///
 /// Upstream kept this `#[cfg(test)]` because the production path always knew
 /// which format it wanted — it came from the editor session that produced the
-/// row. Aimyria One has no editor: the row arrives over a deep link, so the
+/// row. AIMYRIA GO has no editor: the row arrives over a deep link, so the
 /// shape is the only signal available. Inferring from content is therefore the
 /// production path here, not a shortcut.
 pub fn set_provider(id: &str, config: Value) -> Result<(), AppError> {

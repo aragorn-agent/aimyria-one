@@ -1,4 +1,4 @@
-﻿# Aimyria One · 卸载
+﻿# AIMYRIA GO · 卸载
 #
 #   powershell -File uninstall.ps1
 #   powershell -File uninstall.ps1 -Uninstall      # 静默模式（设置→应用 里调的就是这个）
@@ -25,11 +25,23 @@ function Say([string]$m) {
 }
 
 $InstallDir    = Join-Path $env:LOCALAPPDATA 'Aimyria'
-$ShortcutPath  = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Aimyria 一键配置工具.lnk'
+# 两代快捷方式名都要清：1.0.7 及以前叫「Aimyria 一键配置工具」，之后叫 AIMYRIA GO。
+# 只清新名字会留下一个指向已删除 exe 的孤儿快捷方式 —— 用户点了会看到
+# "找不到文件"，而卸载看上去是"成功了"。
+$ShortcutPaths = @(
+    (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\AIMYRIA GO.lnk'),
+    (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Aimyria 一键配置工具.lnk')
+)
 $RunKey        = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$RunValueName  = 'Aimyria One'
+# 要清掉的 Run 值名。
+# 注册表值名大小写不敏感，所以 'AIMYRIA GO' 与 'AimyriA go' 其实是**同一个值**；
+# 两个都列上只是让意图自解释（重复删同一个值是无害的）。
+# 'Aimyria One' 是真正不同的旧产品名，1.0.7 及以前写过。
+$RunValueNames = @('AIMYRIA GO', 'AimyriA go', 'Aimyria One')
 $UninstallKey  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AimyriaOne'
-$ProtocolKey   = 'HKCU:\Software\Classes\aimyria'
+# Both schemes the app registers. Leaving `ccswitch` behind would keep
+# `ccswitch://` links routed at a binary that no longer exists.
+$ProtocolSchemes = @('aimyria', 'ccswitch')
 
 # ── 1. 停掉正在运行的实例 ────────────────────────────────────────────────
 # 不停就删不掉 exe，而且用户会以为卸载失败。
@@ -42,32 +54,35 @@ if ($running) {
 }
 
 # ── 2. 注册表 ────────────────────────────────────────────────────────────
-foreach ($item in @(
-    @{ Path = $RunKey;       Name = $RunValueName },
-    @{ Path = $UninstallKey; Name = $null }
-)) {
-    if (-not (Test-Path $item.Path)) { continue }
-    if ($item.Name) {
-        $existing = (Get-ItemProperty -Path $item.Path).$($item.Name)
+if (Test-Path $RunKey) {
+    foreach ($name in $RunValueNames) {
+        $existing = (Get-ItemProperty -Path $RunKey -ErrorAction SilentlyContinue).$name
         if ($existing) {
-            Say "移除开机自启：$($item.Name)"
-            Remove-ItemProperty -Path $item.Path -Name $item.Name -Force
+            Say "移除开机自启：$name"
+            Remove-ItemProperty -Path $RunKey -Name $name -Force -ErrorAction SilentlyContinue
         }
-    } else {
-        Say '移除「设置 → 应用」中的卸载项'
-        Remove-Item -Path $item.Path -Recurse -Force
     }
 }
 
-if (Test-Path $ProtocolKey) {
-    Say '移除 aimyria:// 深链协议'
-    Remove-Item -Path $ProtocolKey -Recurse -Force
+if (Test-Path $UninstallKey) {
+    Say '移除「设置 → 应用」中的卸载项'
+    Remove-Item -Path $UninstallKey -Recurse -Force
+}
+
+foreach ($scheme in $ProtocolSchemes) {
+    $key = "HKCU:\Software\Classes\$scheme"
+    if (Test-Path $key) {
+        Say "移除 ${scheme}:// 深链协议"
+        Remove-Item -Path $key -Recurse -Force
+    }
 }
 
 # ── 3. 快捷方式 ──────────────────────────────────────────────────────────
-if (Test-Path -LiteralPath $ShortcutPath) {
-    Say '移除开始菜单快捷方式'
-    Remove-Item -LiteralPath $ShortcutPath -Force
+foreach ($sc in $ShortcutPaths) {
+    if (Test-Path -LiteralPath $sc) {
+        Say '移除开始菜单快捷方式'
+        Remove-Item -LiteralPath $sc -Force
+    }
 }
 
 # ── 4. 程序文件 ──────────────────────────────────────────────────────────
@@ -95,7 +110,7 @@ if ($RemoveUserData -and (Test-Path -LiteralPath $userDir)) {
 
 if (-not $Uninstall) {
     Write-Output ''
-    Write-Output '  Aimyria One 已卸载。'
+    Write-Output '  AIMYRIA GO 已卸载。'
     if (-not $RemoveUserData) {
         Write-Output "  账号与配置仍保留在 $userDir，重新安装即可继续使用。"
     }

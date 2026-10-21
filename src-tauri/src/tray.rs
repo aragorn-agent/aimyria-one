@@ -196,11 +196,11 @@ impl TrayTexts {
     pub fn from_language(language: &str) -> Self {
         match language {
             "en" => Self {
-                show_main: "Open AimyriA go",
+                show_main: "Open AIMYRIA GO",
                 open_website: "Open official website",
                 lightweight_mode: "Lightweight mode",
-                quit: "Quit AimyriA go",
-                quit_stops_routing: "Quit AimyriA go",
+                quit: "Quit AIMYRIA GO",
+                quit_stops_routing: "Quit AIMYRIA GO",
                 projects_label: "Projects",
                 no_project_label: "No project",
                 header_direct: "Direct",
@@ -223,10 +223,10 @@ impl TrayTexts {
                 problem_attach_failed:
                     "{app}: {mode} couldn't reconnect at startup; back to direct",
                 problem_switch_failed: "{app} didn't switch: {reason}",
-                problem_more: "{count} more issues — open AimyriA go to see them",
+                problem_more: "{count} more issues — open AIMYRIA GO to see them",
                 desktop_unavailable:
                     "The routing service isn't running; {name} is unavailable for now",
-                tooltip_problem: "AimyriA go · Needs attention: {problem}",
+                tooltip_problem: "AIMYRIA GO · Needs attention: {problem}",
                 feedback_switched: "{app} switched to {name}. Restart {app} to apply",
                 feedback_stack_default:
                     "{app}'s default provider is now {name}. Restart {app} to apply",
@@ -257,11 +257,11 @@ impl TrayTexts {
                 quota_used: false,
             },
             "ja" => Self {
-                show_main: "AimyriA go を開く",
+                show_main: "AIMYRIA GO を開く",
                 open_website: "公式サイトを開く",
                 lightweight_mode: "軽量モード",
-                quit: "AimyriA go を終了",
-                quit_stops_routing: "AimyriA go を終了",
+                quit: "AIMYRIA GO を終了",
+                quit_stops_routing: "AIMYRIA GO を終了",
                 projects_label: "プロジェクト",
                 no_project_label: "プロジェクトを使用しない",
                 header_direct: "直接接続",
@@ -284,10 +284,10 @@ impl TrayTexts {
                 problem_attach_failed: "{app}：前回の{mode}に再接続できず、直接接続に戻りました",
                 problem_switch_failed: "{app} を切り替えられませんでした：{reason}",
                 problem_more:
-                    "ほかに {count} 件の問題があります。AimyriA go を開いて確認してください",
+                    "ほかに {count} 件の問題があります。AIMYRIA GO を開いて確認してください",
                 desktop_unavailable:
                     "ルーティングサービスが動いていないため、{name} は今使えません",
-                tooltip_problem: "AimyriA go · 対応が必要：{problem}",
+                tooltip_problem: "AIMYRIA GO · 対応が必要：{problem}",
                 feedback_switched:
                     "{app} を {name} に切り替えました。反映するには {app} を再起動してください",
                 feedback_stack_default: "{app} のデフォルトのプロバイダーを {name} に変更しました。反映するには {app} を再起動してください",
@@ -318,11 +318,11 @@ impl TrayTexts {
                 quota_used: false,
             },
             "zh-TW" => Self {
-                show_main: "開啟 AimyriA go",
+                show_main: "開啟 AIMYRIA GO",
                 open_website: "開啟官方網站",
                 lightweight_mode: "輕量模式",
-                quit: "退出 AimyriA go",
-                quit_stops_routing: "退出 AimyriA go",
+                quit: "退出 AIMYRIA GO",
+                quit_stops_routing: "退出 AIMYRIA GO",
                 projects_label: "專案",
                 no_project_label: "不使用專案",
                 header_direct: "直連",
@@ -344,9 +344,9 @@ impl TrayTexts {
                 problem_service_down: "路由服務沒在執行（連接埠 {port}）",
                 problem_attach_failed: "{app}：上次的{mode}沒能接上，已回到直連",
                 problem_switch_failed: "{app} 沒切換成功：{reason}",
-                problem_more: "還有 {count} 個問題，開啟 AimyriA go 查看",
+                problem_more: "還有 {count} 個問題，開啟 AIMYRIA GO 查看",
                 desktop_unavailable: "路由服務沒在執行，{name} 暫時無法使用",
-                tooltip_problem: "AimyriA go · 需要處理：{problem}",
+                tooltip_problem: "AIMYRIA GO · 需要處理：{problem}",
                 feedback_switched: "{app} 已切換到 {name}，重新啟動 {app} 後生效",
                 feedback_stack_default: "{app} 的預設供應商改為 {name}，重新啟動 {app} 後生效",
                 feedback_profile: "已把專案「{name}」套用到 {app}",
@@ -376,11 +376,11 @@ impl TrayTexts {
                 quota_used: false,
             },
             _ => Self {
-                show_main: "打开 AimyriA go",
+                show_main: "打开 AIMYRIA GO",
                 open_website: "打开官方网站",
                 lightweight_mode: "轻量模式",
-                quit: "退出 AimyriA go",
-                quit_stops_routing: "退出 AimyriA go",
+                quit: "退出 AIMYRIA GO",
+                quit_stops_routing: "退出 AIMYRIA GO",
                 projects_label: "项目",
                 no_project_label: "不使用项目",
                 header_direct: "直连",
@@ -402,9 +402,9 @@ impl TrayTexts {
                 problem_service_down: "路由服务没在运行（端口 {port}）",
                 problem_attach_failed: "{app}：上次的{mode}没能接上，已回到直连",
                 problem_switch_failed: "{app} 没切换成功：{reason}",
-                problem_more: "还有 {count} 个问题，打开 AimyriA go 查看",
+                problem_more: "还有 {count} 个问题，打开 AIMYRIA GO 查看",
                 desktop_unavailable: "路由服务没在运行，{name} 暂时不可用",
-                tooltip_problem: "AimyriA go · 需要处理：{problem}",
+                tooltip_problem: "AIMYRIA GO · 需要处理：{problem}",
                 feedback_switched: "{app} 已切换到 {name}，重启 {app} 后生效",
                 feedback_stack_default: "{app} 的默认供应商改为 {name}，重启 {app} 后生效",
                 feedback_profile: "已把项目「{name}」用到 {app}",
@@ -1753,9 +1753,23 @@ fn collect_model(app_state: &AppState, texts: &TrayTexts) -> Result<TrayModel, A
 
 /// 退出会让它们断开的情况：路由服务在跑，且有应用在路由 / 聚合模式，或 Claude Desktop 在用
 /// 模型映射卡（和 `controller::stop_server_if_unused` 的「在用」同一口径，隐藏的应用也算）。
-fn routing_in_use(_app_state: &AppState) -> bool {
-    // No local routing service exists in this build.
-    false
+///
+/// This used to return a hardcoded `false` with the comment "No local routing
+/// service exists in this build". That was true of the five CLI clients and
+/// false of Claude Desktop: `claude_desktop_config` writes a 3P profile whose
+/// `inferenceGatewayBaseUrl` points at our local router, and
+/// `mode::controller::ensure_desktop_mapping_service` keeps that router running.
+/// Quitting therefore silenced Desktop's traffic with no warning — the tray's
+/// quit label is the only place a user is told that.
+///
+/// The condition mirrors `stop_server_if_unused`, which is the authority on
+/// "would stopping the server break something": any app's proxy flag set, or
+/// Claude Desktop currently on a gateway-mode provider.
+fn routing_in_use(app_state: &AppState) -> bool {
+    if crate::mode::current::proxy_flags(crate::mode::controller::PROXY_APPS).contains(&true) {
+        return true;
+    }
+    crate::claude_desktop_config::current_provider_uses_proxy(&app_state.db)
 }
 
 // ─── 模型 → Tauri 菜单 ─────────────────────────────────────────────────────────
@@ -1943,7 +1957,7 @@ fn icon_with_problem_dot(icon: &Image<'_>, template: bool) -> Image<'static> {
     Image::new_owned(rgba, width, height)
 }
 
-/// 悬停提示：平时 `AimyriA go`，出问题时 `AimyriA go · 需要处理：<问题区第一条>`。额度不算问题。
+/// 悬停提示：平时 `AIMYRIA GO`，出问题时 `AIMYRIA GO · 需要处理：<问题区第一条>`。额度不算问题。
 ///
 /// 另外：至少有一个客户端已导入时，提示里追加一句「已导入 · 可去点它」。
 /// 这是需求 8 的可见反馈 —— 托盘圆点/行标记说明"导入了、导到哪家"，
@@ -1951,7 +1965,7 @@ fn icon_with_problem_dot(icon: &Image<'_>, template: bool) -> Image<'static> {
 /// 会被专注助手静音、且与"启动静默"的产品定位冲突。
 fn tray_tooltip(texts: &TrayTexts, problems: &[TrayProblem]) -> String {
     let base = match problems.first() {
-        None => "AimyriA go".to_string(),
+        None => "AIMYRIA GO".to_string(),
         Some(problem) => truncate_chars(
             &fill(
                 texts.tooltip_problem,
@@ -2025,7 +2039,9 @@ fn update_problem_indicator(app: &tauri::AppHandle, texts: &TrayTexts, problems:
                 // No dot: the plain icon is already in place. If it somehow is not,
                 // the first problem that appears will correct it, and a missing dot
                 // is a cosmetic loss rather than a wrong signal.
-                log::debug!("[Tray] plain icon already applied at build time; no redundant set_icon");
+                log::debug!(
+                    "[Tray] plain icon already applied at build time; no redundant set_icon"
+                );
             }
         }
     }
@@ -2365,7 +2381,10 @@ fn execute_menu_action(app: &tauri::AppHandle, action: MenuAction) {
         }
         MenuAction::Quit => app.exit(0),
         MenuAction::Navigate(navigation) => navigate(app, navigation),
-        MenuAction::SwitchProvider { app: app_type, provider_id } => {
+        MenuAction::SwitchProvider {
+            app: app_type,
+            provider_id,
+        } => {
             handle_provider_click(app, app_type, &provider_id);
         }
         MenuAction::ApplyProfile { scope, profile_id } => {
@@ -2374,9 +2393,14 @@ fn execute_menu_action(app: &tauri::AppHandle, action: MenuAction) {
     }
 }
 
-/// 产品的官网。托盘「打开官网」与 `product_info` 里那个 `website` 是同一个地址；
-/// 上游这里是 ccswitch.io，换成本站自己的。
-const WEBSITE_URL: &str = "https://aimyria.com";
+/// 产品的官网 —— 工具自己的产品页，不是控制台首页。
+///
+/// 上游这里是 ccswitch.io。我们指向 `/go/`：那里写了这个工具是什么、怎么用、
+/// 当前版本、每一版改了什么、以及下载地址。用户点「打开官网」想找的正是这些；
+/// aimyria.com 首页是控制台/营销页，找不到这个工具的版本与更新日志。
+///
+/// `product_info` 里的 `website` 与这里是同一个地址。
+const WEBSITE_URL: &str = "https://aimyria.com/go/";
 
 /// 让主界面去某个地方：先打开窗口，把导航存下来，再喊一声。
 ///
@@ -2447,7 +2471,10 @@ fn handle_provider_click(app: &tauri::AppHandle, app_type: AppType, provider_id:
             schedule_tray_status_check(app);
         }
         Err(e) => {
-            log::warn!("[Tray] 切换 {} 到 {provider_id} 失败: {e}", app_type.as_str());
+            log::warn!(
+                "[Tray] 切换 {} 到 {provider_id} 失败: {e}",
+                app_type.as_str()
+            );
             record_switch_failure(&app_type, e.to_string());
             schedule_tray_status_check(app);
         }

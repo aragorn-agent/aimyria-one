@@ -1,0 +1,19 @@
+{
+  "version": "1.0.7",
+  "items": [
+    {
+      "type": "improve",
+      "zh": "提升了连接稳定性",
+      "zh-TW": "提升了连接稳定性",
+      "en": "Various improvements",
+      "ja": "各種の改善を行いました"
+    },
+    {
+      "type": "improve",
+      "zh": "改善了使用体验",
+      "zh-TW": "改善了使用体验",
+      "en": "Various improvements",
+      "ja": "各種の改善を行いました"
+    }
+  ]
+}

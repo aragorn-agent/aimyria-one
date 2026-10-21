@@ -1,11 +1,11 @@
-//! Minimal live-config writer for Aimyria One.
+//! Minimal live-config writer for AIMYRIA GO.
 //!
 //! # Why this module exists
 //!
 //! Upstream CC Switch routed every client write through its `mode/` engine —
 //! roughly 10k lines that maintained a pending-operation ledger, rollback
 //! bookkeeping, local-proxy takeover and multi-provider "Stack" merging.
-//! Aimyria One has exactly one provider and no proxy, so none of that applies.
+//! AIMYRIA GO has exactly one provider and no proxy, so none of that applies.
 //! This module replaces the whole engine with a direct, atomic write.
 //!
 //! # Semantics
@@ -56,14 +56,14 @@ use crate::error::AppError;
 /// key in yet. A row containing this value is never written to a live config.
 pub const PENDING_KEY: &str = "aimyria-editor-pending-key";
 
-/// The single provider id Aimyria One writes under.
+/// The single provider id AIMYRIA GO writes under.
 ///
 /// Every client we support is configured from one relay, so there is exactly
 /// one entry to add and exactly one to replace on a re-run. Naming it keeps a
 /// user's own hand-written provider entries in the same file untouched.
 pub const PROVIDER_ID: &str = "aimyria";
 
-/// The clients Aimyria One can configure, in the order the UI shows them.
+/// The clients AIMYRIA GO can configure, in the order the UI shows them.
 ///
 /// `None` for `cli` means "we can write the config, but we do not need the
 /// binary on PATH to do it" — the config file is the contract, not the binary.

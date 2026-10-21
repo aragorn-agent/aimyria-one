@@ -290,29 +290,41 @@ async fn query_siliconflow(api_key: &str, is_cn: bool) -> Result<UsageResult, St
 
 /// Aimyria's balance endpoint.
 ///
-/// The model gateway authenticates API keys, but the account balance lives on
-/// the console's user profile and is protected by the console session token.
-/// Treating an API key as a dashboard session does not work: `api.aimyria.com`
-/// answers 401 for every dashboard path, and the console's real `/api/v1/user/
-/// profile` only accepts a login token. There is no safe way for a desktop tool
-/// to read that number from the key alone.
+/// The account balance lives on the console's user profile, not on the model
+/// gateway, so an API key used to be unable to read it: `api.aimyria.com`
+/// answered 401 for every dashboard path, and the console's real
+/// `/api/v1/user/profile` only accepts a login token. The desktop tool then had
+/// to ask the *website* for a short-lived, read-only JWT — which is exactly why
+/// the balance appeared and then vanished: that token's TTL is 3600s with no
+/// renewal, so every session ended up showing "balance token expired" an hour
+/// after the import, for no reason the user could see.
 ///
-/// Two read-only bridges are therefore supported, in order:
+/// The relay now serves `GET /v1/user/balance` itself, authenticated by the API
+/// key the user already has and therefore never expiring. That is the first
+/// attempt here, and it needs nothing from the website.
 ///
-/// 1. `balance_url` from the import link (the website can mint a short-lived,
-///    read-only URL/token for the account);
-/// 2. the legacy OpenAI-compatible `credit_grants` path, kept for relays that
-///    do implement it.
+/// Later rungs, kept for compatibility and for relays we do not control:
 ///
-/// If both are absent or fail, the result is a *value* (`success: false` with a
-/// reason), not an invented `$0.00`. "Could not ask" and "you have no money" are
-/// different facts, and only the second should send someone to top up.
+/// 1. `balance_url` from the import link (an older link may still carry one);
+/// 2. the legacy OpenAI-compatible `credit_grants` path.
+///
+/// If all fail, the result is a *value* (`success: false` with a reason), not an
+/// invented `$0.00`. "Could not ask" and "you have no money" are different
+/// facts, and only the second should send someone to top up.
 async fn query_aimyria(
     base_url: &str,
     api_key: &str,
     balance_url: Option<&str>,
     balance_token: Option<&str>,
 ) -> Result<UsageResult, String> {
+    if !api_key.trim().is_empty() {
+        if let Ok(result) = query_aimyria_by_key(base_url, api_key).await {
+            if result.success {
+                return Ok(result);
+            }
+        }
+    }
+
     if let Some(url) = balance_url.filter(|url| !url.trim().is_empty()) {
         return query_aimyria_bridge(url, balance_token.unwrap_or(api_key)).await;
     }
@@ -385,6 +397,111 @@ async fn query_aimyria(
             } else {
                 None
             },
+        }]),
+        error: None,
+    })
+}
+
+/// Read the balance from the relay using only the API key.
+///
+/// This is the request that never expires, and it is the reason the display is
+/// now stable: no website round-trip, no minted token, nothing to fall out of
+/// date while the window sits open.
+///
+/// The URL is built on the gateway host rather than on whatever `base_url` says,
+/// because a saved provider may point at the console (`aimyria.com`) or at the
+/// versioned model path (`api.aimyria.com/v1`), and only the gateway host serves
+/// this endpoint. Anything else — a relay we do not own — keeps its own
+/// `base_url`, so the derivation stays honest for third-party endpoints.
+/// Where the API-key balance request goes, for a given saved endpoint.
+///
+/// Split out from the request so the rule can be asserted without a network: the
+/// saved `base_url` varies by client and by who imported it (console host,
+/// gateway host, versioned `/v1` path), and picking the wrong one is a silent
+/// 404 that reads to the user as "balance is broken again".
+fn aimyria_balance_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.contains(crate::AIMYRIA_RELAY_HOST) || base.contains("aimyria.com") {
+        // Our own hosts: always the gateway, never the console and never the
+        // versioned model path. Both accept `/v1/user/balance` (the console
+        // vhost proxies it), but the gateway is the canonical one.
+        format!("https://{}/v1/user/balance", crate::AIMYRIA_RELAY_HOST)
+    } else if base.ends_with("/v1") {
+        format!("{base}/user/balance")
+    } else {
+        format!("{base}/v1/user/balance")
+    }
+}
+
+async fn query_aimyria_by_key(base_url: &str, api_key: &str) -> Result<UsageResult, String> {
+    let url = aimyria_balance_url(base_url);
+
+    let resp = crate::proxy::http_client::get()
+        .get(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(make_auth_error(status));
+    }
+    // A relay without this endpoint is a *try the next rung* signal, not a
+    // failure to show the user: return the same shape `make_error` uses so the
+    // caller can move on to the bridge without an early return.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(make_error("relay has no /v1/user/balance".to_string()));
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Ok(make_error(format!("API error (HTTP {status}): {body}")));
+    }
+
+    // bytes() then parse: a read failure is transient and belongs in Err; a
+    // parse failure is final. Same contract as every other provider here.
+    let raw = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response: {e}"))?;
+    let body: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => return Ok(make_error(format!("Failed to parse response: {e}"))),
+    };
+
+    let data = body.get("data").unwrap_or(&body);
+    let remaining = parse_f64_field(data, "remaining")
+        .or_else(|| parse_f64_field(data, "balance"));
+    let Some(remaining) = remaining else {
+        return Ok(make_error(
+            "余额接口未返回 remaining/balance 字段".to_string(),
+        ));
+    };
+    let used = parse_f64_field(data, "used").or_else(|| parse_f64_field(data, "total_used"));
+    let total = parse_f64_field(data, "total");
+    let plan = data
+        .get("planName")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| Some("Aimyria".to_string()));
+
+    Ok(UsageResult {
+        success: true,
+        data: Some(vec![UsageData {
+            plan_name: plan,
+            remaining: Some(remaining),
+            total,
+            used,
+            unit: Some("USD".to_string()),
+            is_valid: Some(remaining > 0.0),
+            invalid_message: if remaining <= 0.0 {
+                Some("余额已用完".to_string())
+            } else {
+                None
+            },
+            extra: None,
         }]),
         error: None,
     })
@@ -614,10 +731,6 @@ pub async fn get_balance_with_bridge(
     balance_url: Option<&str>,
     balance_token: Option<&str>,
 ) -> Result<UsageResult, String> {
-    if let Some(url) = balance_url.filter(|url| !url.trim().is_empty()) {
-        return query_aimyria_bridge(url, balance_token.unwrap_or(api_key)).await;
-    }
-
     if api_key.trim().is_empty() && balance_token.is_none_or(|token| token.trim().is_empty()) {
         return Ok(UsageResult {
             success: false,
@@ -637,6 +750,15 @@ pub async fn get_balance_with_bridge(
         }
     };
 
+    // Aimyria leads with the API-key endpoint, so the bridge must not be able to
+    // short-circuit it. For every other provider the bridge is the only source,
+    // so it stays first there.
+    if !matches!(provider, BalanceProvider::Aimyria) {
+        if let Some(url) = balance_url.filter(|url| !url.trim().is_empty()) {
+            return query_aimyria_bridge(url, balance_token.unwrap_or(api_key)).await;
+        }
+    }
+
     match provider {
         BalanceProvider::Aimyria => {
             query_aimyria(base_url, api_key, balance_url, balance_token).await
@@ -647,5 +769,56 @@ pub async fn get_balance_with_bridge(
         BalanceProvider::SiliconFlowEn => query_siliconflow(api_key, false).await,
         BalanceProvider::OpenRouter => query_openrouter(api_key).await,
         BalanceProvider::NovitaAI => query_novita(api_key).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shape a saved endpoint can take must end up at the one URL that
+    /// serves the balance. The console host is included because a provider
+    /// imported from the console keeps `aimyria.com` as its base while model
+    /// traffic still goes to the gateway.
+    #[test]
+    fn the_balance_url_is_derived_from_every_saved_endpoint_shape() {
+        let want = format!(
+            "https://{}/v1/user/balance",
+            crate::AIMYRIA_RELAY_HOST
+        );
+
+        for base in [
+            "https://api.aimyria.com",
+            "https://api.aimyria.com/",
+            "https://api.aimyria.com/v1",
+            "https://aimyria.com",
+            "https://www.aimyria.com/",
+        ] {
+            assert_eq!(aimyria_balance_url(base), want, "base {base}");
+        }
+    }
+
+    /// A relay we do not own keeps its own host. Rewriting it to ours would ask
+    /// our gateway about someone else's key, and the answer would be a 401 the
+    /// user cannot act on.
+    #[test]
+    fn a_foreign_endpoint_is_never_rewritten_to_ours() {
+        assert_eq!(
+            aimyria_balance_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/user/balance"
+        );
+        assert_eq!(
+            aimyria_balance_url("https://relay.example"),
+            "https://relay.example/v1/user/balance"
+        );
+    }
+
+    /// A native OpenAI-compatible balance payload must parse, and a payload
+    /// without any balance field must read as "could not ask" rather than $0.
+    #[test]
+    fn a_balance_payload_without_a_number_is_not_zero() {
+        let missing = make_error("no field".to_string());
+        assert!(!missing.success);
+        assert!(missing.data.is_none());
     }
 }

@@ -1,4 +1,4 @@
-//! Deep link import functionality for Aimyria One
+//! Deep link import functionality for AIMYRIA GO
 //!
 //! This module implements the aimyria:// protocol for importing configurations
 //! via deep links: providers, MCP servers, prompts and skills.

@@ -364,13 +364,13 @@ pub struct AppSettings {
     pub skip_claude_onboarding: bool,
     /// 是否开机自启
     ///
-    /// 默认开启：AimyriA go 是常驻托盘的一键接入工具，用户装完就期望它
+    /// 默认开启：AIMYRIA GO 是常驻托盘的一键接入工具，用户装完就期望它
     /// 一直在，不需要每次手动打开。
     #[serde(default = "default_true")]
     pub launch_on_startup: bool,
     /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
     ///
-    /// 默认开启：Aimyria One 是托盘软件。产品承诺是「浏览器点一下就行」，
+    /// 默认开启：AIMYRIA GO 是托盘软件。产品承诺是「浏览器点一下就行」，
     /// 这只有在 app 已经静默运行时才成立——每次登录都弹一个窗口，
     /// 正是后台工具被卸载的原因。
     ///

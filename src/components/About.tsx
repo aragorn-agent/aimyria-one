@@ -23,7 +23,7 @@ export function About({ info }: { info: ProductInfo | null }) {
             className="button button-quiet"
             onClick={() => info && void openExternal(info.website)}
           >
-            {info?.website ?? "aimyria.com"}
+            {info?.website ?? "aimyria.com/go/"}
           </button>
         </p>
       </div>

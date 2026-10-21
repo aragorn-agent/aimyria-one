@@ -106,6 +106,8 @@ pub async fn apply_deeplink_request(
 
     let mut for_client = request.clone();
     for_client.app = Some(app_type.as_str().to_string());
+    let desktop_was_mapping = matches!(app_type, crate::app_config::AppType::ClaudeDesktop)
+        && crate::claude_desktop_config::current_provider_uses_proxy(&state.db);
     let provider_id =
         crate::deeplink::import_provider_from_deeplink(state.inner(), for_client).await?;
     // The website sends a short-lived balance bridge on the same link. Persist
@@ -113,6 +115,15 @@ pub async fn apply_deeplink_request(
     // after the confirmation dialog closes.
     let _ = persist_balance_bridge(state.inner(), &app_type, &request);
     let result = ProviderService::switch(state.inner(), app_type.clone(), &provider_id)?;
+
+    // Claude Desktop in proxy mode points at the local router, so the router has
+    // to be running — a written profile with no listener behind it fails every
+    // request. `switch_provider` does this for the Provider page; the deep-link
+    // path writes through the service directly and would otherwise skip it.
+    if matches!(app_type, crate::app_config::AppType::ClaudeDesktop) {
+        crate::mode::controller::sync_desktop_mapping_service(state.inner(), desktop_was_mapping)
+            .await;
+    }
 
     let mut summary = format!("已配置 {}（供应商 {provider_id}）", app_type.as_str());
     if !result.warnings.is_empty() {

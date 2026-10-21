@@ -6,7 +6,64 @@ use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 /// One definition, because the enable/disable/status paths must agree on it: a
 /// value written under one name and checked under another is a setting that
 /// silently does nothing.
-const APP_NAME: &str = "AimyriA go";
+///
+/// This is the product name, which means renaming the product renames this
+/// value. See [`LEGACY_APP_NAMES`] for why that is not free.
+const APP_NAME: &str = "AIMYRIA GO";
+
+/// Run values written by an *actually different* earlier product name.
+///
+/// Only `Aimyria One` belongs here. `AimyriA go` must NOT be added: registry
+/// value names are **case-insensitive**, so `AimyriA go` and `AIMYRIA GO` are the
+/// same value. Listing it as "legacy" made the enable path write the current
+/// value and then immediately delete it (measured: count 1 -> 0), which silently
+/// turned autostart off for every machine that had ever run an older build.
+///
+/// The remaining case difference is handled by [`migrate_legacy_autostart`],
+/// which recreates the value under the current spelling instead of deleting it.
+const LEGACY_APP_NAMES: [&str; 1] = ["Aimyria One"];
+
+/// The spelling earlier builds used for the *same* Run value as [`APP_NAME`].
+///
+/// Same registry value, different case — see [`LEGACY_APP_NAMES`] for why it
+/// cannot be deleted.
+const LEGACY_CASING: &str = "AimyriA go";
+
+/// Delete `Run` values left by earlier product names.
+///
+/// Best-effort on purpose: a machine where the registry is locked by policy
+/// still gets a working autostart from the current name, and the failure is
+/// logged rather than turned into an error the user cannot act on.
+#[cfg(target_os = "windows")]
+pub fn remove_legacy_run_values() {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(run) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+    ) else {
+        return;
+    };
+
+    for name in LEGACY_APP_NAMES {
+        // 防御：万一有人把当前名的某个大小写变体写进这张表，这里必须拒绝删除 ——
+        // 注册表值名大小写不敏感，删"变体"就是删当前值本身。
+        if name.eq_ignore_ascii_case(APP_NAME) {
+            continue;
+        }
+        if run.get_value::<String, _>(name).is_ok() {
+            match run.delete_value(name) {
+                Ok(()) => log::info!("已移除旧产品名留下的自启项: {name}"),
+                Err(e) => log::warn!("移除旧自启项 {name} 失败: {e}"),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn remove_legacy_run_values() {}
 
 /// 获取 macOS 上的 .app bundle 路径
 /// 将 `/path/to/CC Switch.app/Contents/MacOS/CC Switch` 转换为 `/path/to/CC Switch.app`
@@ -52,9 +109,48 @@ pub fn enable_auto_launch() -> Result<(), AppError> {
     auto_launch
         .enable()
         .map_err(|e| AppError::Message(format!("启用开机自启失败: {e}")))?;
+    // 上面这个 crate 写的是**无引号**路径（实测还带一个尾随空格）。路径里有空格时
+    // Windows 会把第一个空格前当命令、后面当参数，自启直接失效 —— 而
+    // `C:\Users\John Smith\...` 这种用户名在 Windows 上极常见。
+    // 所以再覆盖一次带引号的写法；内容一致，只是 quoting 不同。
+    rewrite_run_value_quoted();
+    // Only after the current value exists: if `enable` failed there is nothing
+    // to leave behind, and removing the legacy value first would trade a
+    // duplicate for no autostart at all.
+    remove_legacy_run_values();
     log::info!("已启用开机自启");
     Ok(())
 }
+
+/// Rewrite the `Run` value with the path quoted.
+///
+/// Best-effort: when this fails the unquoted value the crate wrote is still
+/// there, which works for space-free paths — the majority — so this is not an
+/// error the user needs to see.
+#[cfg(target_os = "windows")]
+fn rewrite_run_value_quoted() {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let quoted = format!("\"{}\"", exe.display());
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(run) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+    ) else {
+        return;
+    };
+    if let Err(e) = run.set_value(APP_NAME, &quoted) {
+        log::warn!("自启项写入带引号路径失败（无空格的路径仍可用）: {e}");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn rewrite_run_value_quoted() {}
 
 /// 禁用开机自启
 pub fn disable_auto_launch() -> Result<(), AppError> {
@@ -62,6 +158,8 @@ pub fn disable_auto_launch() -> Result<(), AppError> {
     auto_launch
         .disable()
         .map_err(|e| AppError::Message(format!("禁用开机自启失败: {e}")))?;
+    // 用户关闭自启时也要清旧名，否则"关了还在启动"。
+    remove_legacy_run_values();
     log::info!("已禁用开机自启");
     Ok(())
 }
@@ -71,7 +169,7 @@ pub fn disable_auto_launch() -> Result<(), AppError> {
 /// # Why this does not just ask the `auto-launch` crate
 ///
 /// `AutoLaunch::is_enabled()` on Windows answers a weaker question than the one
-/// that matters: it reports whether a value named `AimyriA go` exists under
+/// that matters: it reports whether a value named `AIMYRIA GO` exists under
 /// `Run`, and never compares the path inside it.
 ///
 /// That makes a stale entry look like a healthy one. Every ordinary way a machine
@@ -110,17 +208,28 @@ pub fn is_auto_launch_enabled() -> Result<bool, AppError> {
         Err(_) => return Ok(false),
     };
 
-    let registered: String = match run.get_value(APP_NAME) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
-    };
-
     let exe = std::env::current_exe()
         .map_err(|e| AppError::Message(format!("无法获取应用路径: {e}")))?
         .display()
         .to_string();
+    let want = normalize_run_value(&exe);
 
-    Ok(normalize_run_value(&registered) == normalize_run_value(&exe))
+    // 只查当前名。旧拼写 `AimyriA go` 与它大小写不同、但**是同一个注册表值**，
+    // 所以这里不需要也不能额外识别"旧名"——加了反而会把一个值当成两个。
+    if let Ok(registered) = run.get_value::<String, _>(APP_NAME) {
+        return Ok(normalize_run_value(&registered) == want);
+    }
+
+    // 真正不同的旧产品名（`Aimyria One`）仍算"已启用"，避免升级后重复添加。
+    for name in LEGACY_APP_NAMES {
+        if let Ok(registered) = run.get_value::<String, _>(name) {
+            if normalize_run_value(&registered) == want {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Strip the quotes Windows wraps around a command path, leaving a comparable form.
@@ -145,6 +254,104 @@ pub fn is_auto_launch_enabled() -> Result<bool, AppError> {
         .map_err(|e| AppError::Message(format!("检查开机自启状态失败: {e}")))
 }
 
+/// Align the autostart entry with the current product name.
+///
+/// Two different situations, and they need different handling:
+///
+/// 1. **Same value, different spelling** (`AimyriA go` vs `AIMYRIA GO`). Registry
+///    value names are case-insensitive, so this is one value that Windows keeps
+///    displaying under the casing it was first written with. Rewriting the data
+///    does not change the name; only delete-then-recreate does. That is what this
+///    does — and the recreate is unconditional right after the delete, so a
+///    machine is never left without autostart.
+///
+/// 2. **Genuinely different old names** (`Aimyria One`). Those are separate
+///    values; [`remove_legacy_run_values`] removes them.
+///
+/// In both cases the value must already point at *this* exe: it is the same
+/// startup, just renamed. Anything else is left alone for the caller to fix
+/// through the normal enable path.
+#[cfg(target_os = "windows")]
+pub fn migrate_legacy_autostart() {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.display().to_string();
+    let want = normalize_run_value(&exe);
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(run) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+    ) else {
+        return;
+    };
+
+    let current = run
+        .get_value::<String, _>(APP_NAME)
+        .ok()
+        .filter(|v| normalize_run_value(v) == want);
+
+    if current.is_none() {
+        // 没有当前名的值：可能只有旧名，也可能什么都没开。交给 enable 路径判断。
+        let has_legacy_for_us = LEGACY_APP_NAMES.iter().chain(std::iter::once(&LEGACY_CASING))
+            .any(|name| {
+                run.get_value::<String, _>(name)
+                    .map(|v| normalize_run_value(&v) == want)
+                    .unwrap_or(false)
+            });
+        if has_legacy_for_us {
+            match enable_auto_launch() {
+                Ok(()) => log::info!("开机自启已迁到当前产品名"),
+                Err(e) => log::warn!("迁移开机自启失败（旧项保留，仍可启动）: {e}"),
+            }
+        }
+        return;
+    }
+
+    // 当前名已存在且指向本程序。只剩"显示的大小写"可能还是旧拼写。
+    // 判断方法：注册表返回值名时，同一路径下 Windows 保留首次写入的大小写。
+    remove_legacy_run_values();
+    if !run_is_spelled_currently(&exe) {
+        // 重建一次，让 Task Manager → 启动 里显示的是 AIMYRIA GO。
+        // 顺序是 delete 之后立刻 set，中间没有别的分支，失败也会被 set 覆盖回来。
+        let _ = run.delete_value(APP_NAME);
+        match enable_auto_launch() {
+            Ok(()) => log::info!("开机自启显示名已更新为当前产品名"),
+            Err(e) => log::warn!("更新自启显示名失败: {e}"),
+        }
+    }
+}
+
+/// Whether the `Run` value is stored under the current exact spelling.
+///
+/// `winreg` reads values case-insensitively, so the stored spelling has to come
+/// from enumerating the names. A machine that never ran the old build already
+/// matches and is left untouched.
+#[cfg(target_os = "windows")]
+fn run_is_spelled_currently(_exe: &str) -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(run) = hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run") else {
+        return true;
+    };
+    for name in run.enum_values().flatten().map(|(name, _)| name) {
+        if name.eq_ignore_ascii_case(APP_NAME) {
+            return name == APP_NAME;
+        }
+    }
+    // 没找到（不该发生）：不声称需要重建，避免无谓的删写。
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn migrate_legacy_autostart() {}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
@@ -161,6 +368,27 @@ mod tests {
             normalize_run_value(r"C:\APPS\Aimyria\AimyriaOne.exe"),
             normalize_run_value(r"c:\apps\aimyria\aimyriaone.exe"),
         );
+    }
+
+    /// `Run` value names are case-insensitive on Windows, so a "legacy" name that
+    /// differs from the current one only by case is the SAME value.
+    ///
+    /// This was a real regression: listing `AimyriA go` as legacy made the enable
+    /// path write the current value and then delete it (measured 1 -> 0), silently
+    /// turning autostart off for every machine that had run an older build. The
+    /// guard is asserted here because the failure is invisible in unit tests that
+    /// only look at the paths.
+    #[test]
+    fn a_legacy_name_that_is_only_a_case_variant_is_never_deleted() {
+        for name in LEGACY_APP_NAMES {
+            assert!(
+                !name.eq_ignore_ascii_case(APP_NAME),
+                "{name} is the same registry value as {APP_NAME}; deleting it would                  remove the autostart entry we just wrote",
+            );
+        }
+        // The spelling variant we DO keep exists only to be recreated, never deleted.
+        assert!(LEGACY_CASING.eq_ignore_ascii_case(APP_NAME));
+        assert_ne!(LEGACY_CASING, APP_NAME, "it must differ for a rewrite to do anything");
     }
 
     /// A path that differs is a different entry. This is the stale case the whole

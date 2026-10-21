@@ -230,7 +230,7 @@ impl Provider {
                     str_at(options.and_then(|o| o.get("apiKey"))),
                 )
             }
-            // Pi is an upstream-only client. Aimyria One does not configure it,
+            // Pi is an upstream-only client. AIMYRIA GO does not configure it,
             // so there is nothing to read out of its row. Listed explicitly (not
             // `_`) so adding a variant still forces a decision here.
             AppType::Pi => (String::new(), String::new()),

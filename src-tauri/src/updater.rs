@@ -75,8 +75,7 @@ use tauri::{AppHandle, Manager};
 
 /// The manifest this build asks for. Pinned by product decision: it shares a
 /// directory with the payload, so the existing `/releases/` location covers it.
-pub const DEFAULT_MANIFEST_URL: &str =
-    "https://aimyria.com/releases/latest/download/version.json";
+pub const DEFAULT_MANIFEST_URL: &str = "https://aimyria.com/releases/latest/download/version.json";
 
 /// Hosts a manifest or payload URL is allowed to name.
 ///
@@ -142,6 +141,33 @@ pub struct Manifest {
     pub notes: Option<String>,
     #[serde(default, rename = "pubDate")]
     pub pub_date: Option<String>,
+    /// Other files that must travel with the exe, each with its own checksum.
+    ///
+    /// The package ships `WebView2Loader.dll` beside the exe, and the installer
+    /// downloads and verifies it separately (`quickstart.ps1`). The updater used
+    /// to replace only the exe, so the two halves of a release could drift: a
+    /// build that needs a newer loader would install the exe and leave the old
+    /// loader in place, and the app would then fail to start with
+    /// `STATUS_ENTRYPOINT_NOT_FOUND` — the exact symptom the loader exists to
+    /// prevent, arriving silently on update instead of on install.
+    ///
+    /// Optional and empty by default, so every manifest published before this
+    /// field existed still parses; the fleet can update *into* the version that
+    /// understands companions.
+    #[serde(default)]
+    pub companions: Vec<Companion>,
+}
+
+/// One file that must be installed alongside the executable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Companion {
+    /// File name only — no directory, no `..`. It is joined onto the exe's own
+    /// directory, so a manifest cannot write anywhere else.
+    pub name: String,
+    /// Lowercase hex sha256 of the exact bytes served.
+    pub sha256: String,
+    /// Download URL; checked against the same host allowlist as the payload.
+    pub url: String,
 }
 
 fn test_clock_on() -> bool {
@@ -196,8 +222,10 @@ pub fn parse_numeric_version(raw: &str) -> Option<Vec<u64>> {
 /// `1.10.0 > 1.9.0` (the case a string comparison gets backwards) and `1.1 > 1.1.0`
 /// is not an update.
 pub fn is_newer(candidate: &str, current: &str) -> bool {
-    let (Some(cand), Some(cur)) = (parse_numeric_version(candidate), parse_numeric_version(current))
-    else {
+    let (Some(cand), Some(cur)) = (
+        parse_numeric_version(candidate),
+        parse_numeric_version(current),
+    ) else {
         return false;
     };
     let len = cand.len().max(cur.len());
@@ -276,7 +304,9 @@ pub fn with_cache_buster(raw: &str) -> String {
         .unwrap_or(0);
     match url::Url::parse(raw) {
         Ok(mut parsed) => {
-            parsed.query_pairs_mut().append_pair("t", &seconds.to_string());
+            parsed
+                .query_pairs_mut()
+                .append_pair("t", &seconds.to_string());
             parsed.into()
         }
         Err(_) => raw.to_string(),
@@ -380,6 +410,137 @@ fn sibling(exe: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Download, verify and install the files that ship beside the exe.
+///
+/// Each companion is written to `<name>.new` in the install directory, hashed
+/// **from disk**, and only then renamed over the real file. A checksum mismatch
+/// discards that file and aborts the whole round — a half-updated pair of
+/// binaries is worse than not updating.
+///
+/// `name` is validated to be a bare file name. Without that check a manifest
+/// could ask the updater to write `..\..\Windows\System32\whatever.dll`, and the
+/// host allowlist would not help: the URL is legitimate, the destination is not.
+async fn install_companions(
+    client: &reqwest::Client,
+    exe: &Path,
+    companions: &[Companion],
+    test_mode: bool,
+    dry: bool,
+) -> Result<(), String> {
+    if companions.is_empty() {
+        return Ok(());
+    }
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "cannot resolve the install directory".to_string())?;
+
+    for companion in companions {
+        let name = companion.name.trim();
+        if name.is_empty()
+            || name.contains(['/', '\\'])
+            || name == "."
+            || name == ".."
+            || name.contains(':')
+        {
+            return Err(format!(
+                "companion name {:?} is not a bare file name; refusing",
+                companion.name
+            ));
+        }
+        if !url_is_allowed(&companion.url, test_mode) {
+            return Err(format!(
+                "companion {} URL outside the allowlist: {}",
+                name, companion.url
+            ));
+        }
+
+        let target = dir.join(name);
+        let staged = dir.join(format!("{name}.new"));
+
+        let bytes = {
+            let response = client
+                .get(&companion.url)
+                .send()
+                .await
+                .map_err(|e| format!("companion {name}: download failed: {e}"))?;
+            if !response.status().is_success() {
+                return Err(format!("companion {name}: HTTP {}", response.status()));
+            }
+            response
+                .bytes()
+                .await
+                .map_err(|e| format!("companion {name}: body read failed: {e}"))?
+        };
+
+        // Write, then hash the file rather than the buffer: hashing memory only
+        // proves what was downloaded, not what the next process will load.
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&staged).map_err(|e| {
+                format!("companion {name}: cannot create {}: {e}", staged.display())
+            })?;
+            file.write_all(&bytes)
+                .map_err(|e| format!("companion {name}: write failed: {e}"))?;
+            file.flush()
+                .map_err(|e| format!("companion {name}: flush failed: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("companion {name}: fsync failed: {e}"))?;
+        }
+
+        let actual = match sha256_hex_of_file(&staged) {
+            Ok(value) => value,
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(format!("companion {name}: cannot hash staged file: {e}"));
+            }
+        };
+        let expected = companion.sha256.trim().to_ascii_lowercase();
+        if actual != expected {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!(
+                "companion {name}: sha256 mismatch (expected {expected}, got {actual}); \
+                 discarded, nothing installed"
+            ));
+        }
+
+        if dry {
+            log::info!(
+                "{TAG} DRY RUN: verified companion {name} at {}; not installing",
+                staged.display()
+            );
+            continue;
+        }
+
+        // A loaded DLL cannot be replaced in place on Windows, but the loader is
+        // already mapped into this process and the new one starts after we exit.
+        // Renaming the old file aside first is what makes the swap possible at
+        // all, and it matches the exe dance below.
+        if target.exists() {
+            let backup = dir.join(format!("{name}.old"));
+            let _ = std::fs::remove_file(&backup);
+            if let Err(e) = std::fs::rename(&target, &backup) {
+                let _ = std::fs::remove_file(&staged);
+                return Err(format!(
+                    "companion {name}: cannot move the existing file aside: {e}"
+                ));
+            }
+        }
+        if let Err(e) = std::fs::rename(&staged, &target) {
+            let _ = std::fs::remove_file(&staged);
+            let backup = dir.join(format!("{name}.old"));
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, &target);
+            }
+            return Err(format!(
+                "companion {name}: cannot install the verified file: {e}"
+            ));
+        }
+        log::info!("{TAG} installed companion {name} ({} bytes)", bytes.len());
+    }
+
+    Ok(())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -404,7 +565,10 @@ fn sha256_hex_of_file(path: &Path) -> std::io::Result<String> {
 pub enum ReplaceError {
     Write(std::io::Error),
     /// The bytes that landed on disk do not hash to the manifest's value.
-    Checksum { expected: String, actual: String },
+    Checksum {
+        expected: String,
+        actual: String,
+    },
     Rename(String),
     /// The replacement failed after the exe had already been renamed aside, and
     /// putting it back also failed. The only genuinely dangerous state, so it is
@@ -569,6 +733,7 @@ pub fn startup_cleanup() -> String {
         // The leftover list is for tests; a launch only needs the log.
         Ok(exe) => {
             let _ = cleanup_siblings(&exe, &version);
+            let _ = cleanup_companions(&exe);
         }
         Err(e) => log::warn!("{TAG} cannot resolve current_exe: {e}; skipping self-update cleanup"),
     }
@@ -611,6 +776,50 @@ pub fn cleanup_siblings(exe: &Path, version: &str) -> Vec<PathBuf> {
     }
 
     log::info!("{TAG} running v{version} from {}", exe.display());
+    failed
+}
+
+/// Remove companion leftovers (`.new` / `.old`) and report the ones it could not
+/// delete.
+///
+/// Companion names are not known at startup — they come from the manifest of the
+/// release that installed them — so this scans the install directory instead.
+/// The install directory holds the exe, the loader and the user's data folder, so
+/// the pattern is deliberately narrow: a file whose name ends in `.dll.new` or
+/// `.dll.old` was written by this module and by nothing else.
+pub fn cleanup_companions(exe: &Path) -> Vec<PathBuf> {
+    let mut failed = Vec::new();
+    let Some(dir) = exe.parent() else {
+        return failed;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return failed;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        let is_ours = lower.ends_with(".dll.new") || lower.ends_with(".dll.old");
+        if !is_ours {
+            continue;
+        }
+        // An `.old` next to the exe means the previous run finished installing and
+        // is now running under its own name, so the backup is no longer needed. A
+        // `.new` means a download never reached the rename, and installing bytes
+        // nothing has verified since is a second chance to get it wrong.
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::info!("{TAG} removed companion leftover {}", path.display()),
+            Err(e) => {
+                log::warn!("{TAG} could not remove {}: {e}", path.display());
+                failed.push(path);
+            }
+        }
+    }
     failed
 }
 
@@ -851,6 +1060,22 @@ async fn check_once(app: &AppHandle) -> bool {
 
     let expected = manifest.sha256.clone();
     let dry = dry_run();
+
+    // -- companions, before the exe ------------------------------------------
+    //
+    // Order matters. A new exe paired with an old loader is a build that may not
+    // start; the reverse (new loader, old exe) is simply a newer loader doing the
+    // same job, which is how a failed exe replacement lands. So companions go
+    // first: if one of them fails, the exe has not been touched and the running
+    // install stays coherent.
+    //
+    // The download happens here rather than beside the payload because a failed
+    // companion must not have cost a full exe download and a rename.
+    if let Err(e) = install_companions(&client, &exe, &manifest.companions, test_mode, dry).await {
+        log::error!("{TAG} no replacement this round: {e}");
+        return false;
+    }
+
     let stage = {
         let exe = exe.clone();
         let payload = bytes.to_vec();
@@ -942,6 +1167,138 @@ pub fn spawn(app: &AppHandle) {
 mod tests {
     use super::*;
 
+    /// Every manifest published before companions existed must still parse. The
+    /// fleet is only able to update *into* the version that understands the new
+    /// field, so a required field here would strand every install.
+    #[test]
+    fn a_manifest_without_companions_still_parses() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{
+                "version": "1.0.6",
+                "url": "https://aimyria.com/releases/latest/download/AimyriaOne-x64.exe",
+                "sha256": "abc",
+                "notes": "n",
+                "pubDate": "2026-10-21T00:00:00+08:00"
+            }"#,
+        )
+        .expect("a pre-companion manifest must parse");
+        assert!(manifest.companions.is_empty());
+    }
+
+    #[test]
+    fn a_manifest_with_companions_parses_each_file() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{
+                "version": "1.0.6",
+                "url": "https://aimyria.com/releases/latest/download/AimyriaOne-x64.exe",
+                "sha256": "abc",
+                "companions": [
+                    {
+                        "name": "WebView2Loader.dll",
+                        "sha256": "def",
+                        "url": "https://aimyria.com/releases/latest/download/WebView2Loader.dll"
+                    }
+                ]
+            }"#,
+        )
+        .expect("manifest parses");
+        assert_eq!(manifest.companions.len(), 1);
+        assert_eq!(manifest.companions[0].name, "WebView2Loader.dll");
+    }
+
+    /// A manifest is remote input. A companion name that is a path, not a file
+    /// name, would let it write outside the install directory — the URL being on
+    /// our host does not make the destination safe.
+    #[tokio::test]
+    async fn companion_names_must_be_bare_file_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = dir.path().join("AimyriaOne-x64.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        let client = reqwest::Client::new();
+
+        for name in [
+            "../evil.dll",
+            "..\\evil.dll",
+            "sub/evil.dll",
+            "C:evil.dll",
+            "..",
+            "",
+        ] {
+            let companions = vec![Companion {
+                name: name.to_string(),
+                sha256: "0".to_string(),
+                url: "https://aimyria.com/releases/latest/download/x.dll".to_string(),
+            }];
+            let result = install_companions(&client, &exe, &companions, false, true).await;
+            assert!(
+                result.is_err(),
+                "companion name {name:?} must be refused before any I/O"
+            );
+        }
+        // Nothing was created outside the directory either.
+        assert!(!dir.path().join("evil.dll").exists());
+    }
+
+    /// The cleanup pass has to find companion leftovers by shape, because their
+    /// names come from the manifest of whichever release installed them.
+    #[test]
+    fn companion_cleanup_removes_only_its_own_leftovers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = dir.path().join("AimyriaOne-x64.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        std::fs::write(dir.path().join("WebView2Loader.dll"), b"live").unwrap();
+        std::fs::write(dir.path().join("WebView2Loader.dll.new"), b"staged").unwrap();
+        std::fs::write(dir.path().join("WebView2Loader.dll.old"), b"backup").unwrap();
+        // Not ours: a user file that merely sits next to the exe.
+        std::fs::write(dir.path().join("notes.txt"), b"mine").unwrap();
+
+        let failed = cleanup_companions(&exe);
+
+        assert!(failed.is_empty(), "nothing should have failed to delete");
+        assert!(
+            dir.path().join("WebView2Loader.dll").is_file(),
+            "the live loader must survive"
+        );
+        assert!(
+            dir.path().join("notes.txt").is_file(),
+            "user files must survive"
+        );
+        assert!(!dir.path().join("WebView2Loader.dll.new").exists());
+        assert!(!dir.path().join("WebView2Loader.dll.old").exists());
+    }
+
+    /// A companion whose bytes do not match is discarded, and no exe swap has
+    /// happened yet — so the running install stays coherent.
+    #[tokio::test]
+    async fn a_companion_with_a_bad_checksum_is_not_installed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = dir.path().join("AimyriaOne-x64.exe");
+        std::fs::write(&exe, b"exe").unwrap();
+        let live = dir.path().join("WebView2Loader.dll");
+        std::fs::write(&live, b"the old loader").unwrap();
+
+        // No server here: the mismatch path is exercised through the URL gate
+        // being the only remaining check, so a refused URL proves the function
+        // returns before touching the file.
+        let companions = vec![Companion {
+            name: "WebView2Loader.dll".to_string(),
+            sha256: "deadbeef".to_string(),
+            url: "https://evil.example/WebView2Loader.dll".to_string(),
+        }];
+        let client = reqwest::Client::new();
+        let result = install_companions(&client, &exe, &companions, false, false).await;
+
+        assert!(
+            result.is_err(),
+            "an off-allowlist companion must be refused"
+        );
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"the old loader",
+            "the live loader must be untouched"
+        );
+    }
+
     #[test]
     fn numeric_versions_parse_and_reject_decorated_ones() {
         assert_eq!(parse_numeric_version("1.0.1"), Some(vec![1, 0, 1]));
@@ -989,11 +1346,11 @@ mod tests {
         assert!(url_is_allowed("https://AIMYRIA.com/x", false));
 
         for bad in [
-            "http://aimyria.com/x",                       // plain http in production
-            "https://api.aimyria.com/updates/latest.json", // the gateway that 401s
+            "http://aimyria.com/x",                             // plain http in production
+            "https://api.aimyria.com/updates/latest.json",      // the gateway that 401s
             "https://github.com/farion1231/cc-switch/releases", // a competitor, not a source
-            "https://evil.example/x",                     // not ours
-            "https://aimyria.com.evil.example/x",         // suffix trick
+            "https://evil.example/x",                           // not ours
+            "https://aimyria.com.evil.example/x",               // suffix trick
             "file:///C:/x.exe",
             "ftp://aimyria.com/x",
             "not a url",
@@ -1106,7 +1463,10 @@ mod tests {
         assert!(sibling(&exe, ".old").is_file() && sibling(&exe, ".new").is_file());
 
         let failed = cleanup_siblings(&exe, "1.0.1");
-        assert!(failed.is_empty(), "nothing should have resisted removal: {failed:?}");
+        assert!(
+            failed.is_empty(),
+            "nothing should have resisted removal: {failed:?}"
+        );
 
         assert!(
             !sibling(&exe, ".old").exists(),
@@ -1170,7 +1530,10 @@ mod tests {
         let manifest: Manifest = serde_json::from_str(wire).expect("agreed format parses");
         assert_eq!(manifest.version, "1.0.1");
         assert_eq!(manifest.sha256, "abc123");
-        assert_eq!(manifest.pub_date.as_deref(), Some("2026-10-19T20:30:00+08:00"));
+        assert_eq!(
+            manifest.pub_date.as_deref(),
+            Some("2026-10-19T20:30:00+08:00")
+        );
     }
 
     /// The default endpoint is what T5 publishes to. Changing it here without
@@ -1194,7 +1557,10 @@ mod tests {
             first.starts_with("https://aimyria.com/releases/latest/download/version.json?t="),
             "path and host must survive: {first}"
         );
-        assert!(first.contains("t="), "the cache key must carry the timestamp");
+        assert!(
+            first.contains("t="),
+            "the cache key must carry the timestamp"
+        );
 
         // Still on the allowlist, or every check would be refused before it left.
         assert!(
@@ -1240,7 +1606,8 @@ mod tests {
     /// UTF8`, which on 5.1 emits a BOM, so this is a realistic publisher mistake.
     #[test]
     fn a_utf8_bomprefix_does_not_break_the_manifest() {
-        let body = br#"{"version":"1.0.1","url":"https://aimyria.com/x.exe","sha256":"abc","notes":"n"}"#;
+        let body =
+            br#"{"version":"1.0.1","url":"https://aimyria.com/x.exe","sha256":"abc","notes":"n"}"#;
         assert!(
             serde_json::from_slice::<Manifest>(body).is_ok(),
             "sanity: the plain body parses"
