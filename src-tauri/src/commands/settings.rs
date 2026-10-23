@@ -63,6 +63,7 @@ pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
 /// 保存设置
 #[tauri::command]
 pub async fn save_settings(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::store::AppState>,
     settings: crate::settings::AppSettings,
 ) -> Result<bool, String> {
@@ -73,7 +74,23 @@ pub async fn save_settings(
     let unify_codex_enabled = merged.unify_codex_session_history;
     let classic_subagents_changed =
         merged.codex_stack_classic_subagents != existing.codex_stack_classic_subagents;
+    let tray_visibility_changed = merged.show_in_tray != existing.show_in_tray;
     crate::settings::update_settings(merged).map_err(|e| e.to_string())?;
+
+    // Apply the tray-icon switch immediately.
+    //
+    // Saving a setting that only takes effect after a restart is indistinguishable
+    // from a setting that does not work — and this one did not work at all before.
+    //
+    // The fallback matters: hiding the icon while the window is also hidden would
+    // leave no entry point, so `window_policy` keeps the taskbar button in that
+    // case, and this brings the window back if the user just removed their only
+    // way in.
+    if tray_visibility_changed {
+        if let Err(err) = apply_tray_visibility(&app) {
+            log::warn!("应用托盘图标设置失败: {err}");
+        }
+    }
 
     // 经典子 agent 开关只影响 Stack 模式下的合并目录：立即重写，失败时回滚设置，
     // 免得界面显示已打开、客户端还是旧目录。
@@ -373,6 +390,59 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
         crate::auto_launch::disable_auto_launch().map_err(|e| format!("禁用开机自启失败: {e}"))?;
     }
     Ok(true)
+}
+
+/// Apply the `show_in_tray` switch to the live tray icon.
+///
+/// Computes the policy from the current window state rather than from the setting
+/// alone: hiding the icon while the window is also hidden would leave a running
+/// process with no way in. In that case [`crate::window_policy`] keeps the taskbar
+/// button, and this brings the window back so the user can see what happened
+/// instead of discovering a headless process in Task Manager.
+fn apply_tray_visibility(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+
+    let settings = crate::settings::get_settings();
+    let window = app.get_webview_window("main");
+    let window_visible = window
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+
+    let policy = crate::window_policy::decide(crate::window_policy::WindowState {
+        window_visible,
+        show_in_tray: settings.show_in_tray,
+        lightweight: crate::lightweight::is_lightweight_mode(),
+    });
+
+    if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
+        tray.set_visible(policy.tray_icon)
+            .map_err(|e| format!("切换托盘图标失败: {e}"))?;
+    }
+
+    // Keep the taskbar button consistent with the policy.
+    #[cfg(target_os = "windows")]
+    if let Some(window) = window.as_ref() {
+        let _ = window.set_skip_taskbar(!policy.taskbar_button);
+    }
+
+    // If the icon went away while the window was hidden, bring the window up: the
+    // user just removed their only entry point and needs to see that the app is
+    // still alive (and where its button is now).
+    if !policy.tray_icon && !window_visible {
+        if let Some(window) = window.as_ref() {
+            let _ = window.show();
+            let _ = window.set_focus();
+            log::info!("托盘图标已隐藏且窗口原本隐藏，已唤出窗口以免失去入口");
+        }
+    }
+
+    log::info!(
+        "托盘图标: {}，任务栏按钮: {}",
+        if policy.tray_icon { "显示" } else { "隐藏" },
+        if policy.taskbar_button { "保留" } else { "移除" }
+    );
+    Ok(())
 }
 
 #[cfg(test)]

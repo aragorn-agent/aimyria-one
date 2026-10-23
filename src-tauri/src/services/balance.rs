@@ -421,16 +421,47 @@ async fn query_aimyria(
 /// 404 that reads to the user as "balance is broken again".
 fn aimyria_balance_url(base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
-    if base.contains(crate::AIMYRIA_RELAY_HOST) || base.contains("aimyria.com") {
-        // Our own hosts: always the gateway, never the console and never the
-        // versioned model path. Both accept `/v1/user/balance` (the console
-        // vhost proxies it), but the gateway is the canonical one.
+    if is_our_host(base) {
+        // Our own hosts: always the gateway, never the console.
+        //
+        // Measured, and it is the reason this rewrite exists rather than passing
+        // `base` through: `https://aimyria.com/v1/user/balance` answers **404**
+        // while `https://api.aimyria.com/v1/user/balance` answers 200 with the
+        // balance. A saved provider imported from the console keeps
+        // `https://aimyria.com` as its base URL, so without this rewrite every
+        // such user saw 「余额待开通」 for an account that had money on it.
         format!("https://{}/v1/user/balance", crate::AIMYRIA_RELAY_HOST)
     } else if base.ends_with("/v1") {
         format!("{base}/user/balance")
     } else {
         format!("{base}/v1/user/balance")
     }
+}
+
+/// Is this endpoint one of ours?
+///
+/// Host-aware rather than a bare substring test: `contains("aimyria.com")` also
+/// matches `aimyria.com.evil.example` and `notaimyria.com`, and rewriting a third
+/// party's endpoint to our gateway would ask our server about their key — a 401
+/// the user cannot act on, on a relay we have no business probing.
+fn is_our_host(base: &str) -> bool {
+    const OURS: [&str; 3] = [
+        crate::AIMYRIA_RELAY_HOST,
+        "aimyria.com",
+        "sub2.aimyria.com",
+    ];
+    let after_scheme = base
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip userinfo and port so `user@api.aimyria.com:443` still compares.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host_port.split(':').next().unwrap_or(host_port);
+
+    OURS.iter()
+        .any(|ours| host.eq_ignore_ascii_case(ours))
+        || host.eq_ignore_ascii_case("www.aimyria.com")
 }
 
 async fn query_aimyria_by_key(base_url: &str, api_key: &str) -> Result<UsageResult, String> {
@@ -811,6 +842,48 @@ mod tests {
             aimyria_balance_url("https://relay.example"),
             "https://relay.example/v1/user/balance"
         );
+    }
+
+    /// Look-alike domains must not be rewritten to our gateway.
+    ///
+    /// The previous rule was `base.contains("aimyria.com")`, which matches
+    /// `notaimyria.com` and `aimyria.com.evil.example`. Sending a bearer token for
+    /// a user's third-party key to our server is both wrong and a credential leak
+    /// in the direction that matters least — but it also turns a working third-party
+    /// balance into a 401, which reads as "balance is broken".
+    #[test]
+    fn look_alike_domains_keep_their_own_balance_host() {
+        for base in [
+            "https://notaimyria.com/v1",
+            "https://aimyria.com.evil.example",
+            "https://api.aimyria.community/v1",
+        ] {
+            assert_eq!(
+                aimyria_balance_url(base),
+                format!("{}/v1/user/balance", base.trim_end_matches("/v1")),
+                "{base} must keep its own host"
+            );
+        }
+    }
+
+    /// The sub-gateway and the bare console host are ours too.
+    ///
+    /// `sub2.aimyria.com` is what a newer console import stores as the Codex base
+    /// URL, and it serves the same balance endpoint; the bare host is what a Claude
+    /// import stores. Both must resolve to the gateway, which is the only host that
+    /// answers `/v1/user/balance`.
+    #[test]
+    fn every_one_of_our_hosts_resolves_to_the_gateway() {
+        let want = format!("https://{}/v1/user/balance", crate::AIMYRIA_RELAY_HOST);
+        for base in [
+            "https://aimyria.com",
+            "https://www.aimyria.com/",
+            "https://sub2.aimyria.com/v1",
+            "https://api.aimyria.com/v1",
+            "https://user:pass@api.aimyria.com:443/v1",
+        ] {
+            assert_eq!(aimyria_balance_url(base), want, "base {base}");
+        }
     }
 
     /// A native OpenAI-compatible balance payload must parse, and a payload

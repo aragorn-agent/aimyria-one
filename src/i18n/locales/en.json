@@ -817,6 +817,8 @@
     "silentStartupDescription": "Start in background mode without showing main window",
     "autoLaunchFailed": "Failed to set auto-launch",
     "minimizeToTray": "Minimize to tray on close",
+    "showInTray": "Show tray icon",
+    "showInTrayHelp": "Hide the icon from the system tray. The window's taskbar button is kept, so closing the window still leaves a way back in.",
     "minimizeToTrayDescription": "When checked, clicking the close button will hide to system tray, otherwise the app will exit directly.",
     "useAppWindowControls": "Enable app-level window controls",
     "useAppWindowControlsDescription": "Use built-in minimize, maximize/restore, and close buttons in the app header.",

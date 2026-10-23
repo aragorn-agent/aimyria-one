@@ -106,6 +106,29 @@ $userDir = Join-Path $env:USERPROFILE '.aimyria'
 if ($RemoveUserData -and (Test-Path -LiteralPath $userDir)) {
     Say "删除 $userDir"
     Remove-Item -LiteralPath $userDir -Recurse -Force
+} elseif (Test-Path -LiteralPath $userDir) {
+    # 默认保留 ~/.aimyria（API Key、历史），但**删掉登录凭据**。
+    #
+    # 为什么区别对待：API Key 是用户自己可以revoke 的、有明确归属的配置；
+    # 而 session.bin 是一个仍然可用的登录态。卸载后把一个还能登录账户的凭据
+    # 留在磁盘上，没有任何理由——用户下次重装，重新登录一次的成本是 10 秒。
+    #
+    # 只覆盖一个文件名，而不是清空整个目录，所以 Key 和历史不受影响。
+    $sessionFiles = @('session.bin', 'session.bin.tmp')
+    foreach ($name in $sessionFiles) {
+        $path = Join-Path $userDir $name
+        if (Test-Path -LiteralPath $path) {
+            # 先覆写再删：机械盘上被 unlink 的内容仍可能残留在空闲块里。
+            try {
+                $len = [Math]::Min((Get-Item -LiteralPath $path).Length, 65536)
+                if ($len -gt 0) {
+                    [System.IO.File]::WriteAllBytes($path, (New-Object byte[] $len))
+                }
+            } catch { }
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            Say "已清除登录凭据（API Key 与历史保留）"
+        }
+    }
 }
 
 if (-not $Uninstall) {

@@ -77,17 +77,17 @@ pub struct ClientSpec {
 
 /// Every client this build can write.
 ///
-/// `GrokBuild`, `Hermes`, `Pi` and `Mcode` are upstream clients we do not
-/// configure: writing a config for a tool we cannot support would fail at the
-/// worst moment, so they are absent rather than half-wired.
+/// `GrokBuild`, `Pi` and `Mcode` are upstream clients we do not configure:
+/// writing a config for a tool we cannot support would fail at the worst moment,
+/// so they are absent rather than half-wired.
 ///
-/// `ClaudeDesktop` was listed as absent for the same reason, and that reason was
-/// wrong. It is not half-wired — `claude_desktop_config` is 2,000-odd lines with
-/// `apply_provider`, `get_status`, `provider_mode` and the gateway token, and
-/// `services/provider/live.rs` handles `AppType::ClaudeDesktop` on read, on write
-/// and on the additive-mode check. It was simply never added to this list, so a
-/// one-click link configured five of the six clients and skipped the one the owner
-/// was looking at.
+/// `Hermes` used to be listed here as unsupported, and that was wrong in the same
+/// way the Claude Desktop omission was wrong: `hermes_config::set_provider` is a
+/// full writer (YAML merge, backup, write lock), `services/provider/live.rs` already
+/// dispatches `AppType::Hermes` to it, and the deep-link importer can create a
+/// Hermes provider row. The only thing missing was this entry — so the screen
+/// listed Hermes as a client the product supports (it is in the shared app list)
+/// while `configure_one` answered "暂不支持配置 hermes" for anyone who pressed it.
 pub const CLIENTS: &[ClientSpec] = &[
     ClientSpec {
         app_type: AppType::Claude,
@@ -119,6 +119,13 @@ pub const CLIENTS: &[ClientSpec] = &[
         app_type: AppType::OpenClaw,
         label: "OpenClaw",
         cli: Some("openclaw"),
+    },
+    ClientSpec {
+        app_type: AppType::Hermes,
+        label: "Hermes",
+        // The agent ships as a Python package; the config file is the contract,
+        // so a missing binary must not block writing it.
+        cli: None,
     },
 ];
 
@@ -152,6 +159,10 @@ pub fn live_path(app_type: &AppType) -> Option<PathBuf> {
         AppType::ClaudeDesktop => crate::claude_desktop_config::get_config_library_path()
             .ok()
             .map(|dir| dir.join(format!("{}.json", crate::claude_desktop_config::PROFILE_ID))),
+        // Hermes keeps providers in `config.yaml` under `custom_providers`; the
+        // YAML file is written whole by `set_provider` (it merges, then replaces
+        // atomically), so this is the file whose contents answer "configured?".
+        AppType::Hermes => Some(crate::hermes_config::get_hermes_config_path()),
         _ => None,
     }
 }
@@ -169,6 +180,16 @@ pub fn write(app_type: &AppType, settings: &Value) -> Result<(), AppError> {
         AppType::Gemini => write_gemini(settings),
         AppType::OpenCode => write_opencode(settings),
         AppType::OpenClaw => write_openclaw(settings),
+        // Hermes writes through `hermes_config`, which owns the YAML merge, the
+        // backup and the write lock. Re-implementing a YAML merge here would be a
+        // second writer with its own bugs; instead this delegates to the one that
+        // the provider-switch path already uses.
+        AppType::Hermes => {
+            let value = settings.clone();
+            crate::hermes_config::set_provider(crate::live_writer::PROVIDER_ID, value)
+                .map(|_| ())
+                .map_err(|e| AppError::InvalidInput(e.to_string()))
+        }
         other => Err(AppError::InvalidInput(format!(
             "{} is not supported by this build yet",
             other.as_str()

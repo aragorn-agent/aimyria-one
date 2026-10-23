@@ -122,6 +122,18 @@ pub fn enable_auto_launch() -> Result<(), AppError> {
     Ok(())
 }
 
+/// The argument the start-on-login entry passes.
+///
+/// This is load-bearing, not decoration. The single-instance callback uses it to
+/// tell "the machine started us" from "the user double-clicked the icon": absent
+/// the flag, a login start would be treated as a user request and pop the window
+/// in someone's face every time they sign in.
+///
+/// It also keeps older behaviour intact — before it existed, a bare relaunch was
+/// ignored outright, so the login path showing no window was the *implicit*
+/// contract. Now it is explicit.
+const AUTOSTART_FLAG: &str = "--autostart";
+
 /// Rewrite the `Run` value with the path quoted.
 ///
 /// Best-effort: when this fails the unquoted value the crate wrote is still
@@ -135,7 +147,7 @@ fn rewrite_run_value_quoted() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let quoted = format!("\"{}\"", exe.display());
+    let quoted = format!("\"{}\" {}", exe.display(), AUTOSTART_FLAG);
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let Ok(run) = hkcu.open_subkey_with_flags(
@@ -232,11 +244,38 @@ pub fn is_auto_launch_enabled() -> Result<bool, AppError> {
     Ok(false)
 }
 
-/// Strip the quotes Windows wraps around a command path, leaving a comparable form.
+/// Strip the quotes Windows wraps around a command path, and drop the
+/// start-on-login flag, leaving a comparable exe path.
+///
+/// The flag MUST be removed before comparing: `is_auto_launch_enabled` compares
+/// this form against a bare `current_exe()`, so leaving `"C:\...\x.exe" --autostart`
+/// intact would make a perfectly healthy entry read as "points somewhere else" and
+/// be rewritten on every single launch — a harmless-looking write that repaints the
+/// value and, worse, makes `seed_autostart` re-enable an entry the user had turned
+/// off in Task Manager.
+///
+/// `--autostart` is written by [`rewrite_run_value_quoted`]; older installs have a
+/// bare path, which still normalises to the same string.
 #[cfg(target_os = "windows")]
 fn normalize_run_value(value: &str) -> String {
-    value
-        .trim()
+    let trimmed = value.trim();
+    // Prefer the quoted exe path when present: the tail is our own argument.
+    let path_part = match trimmed.strip_prefix('"') {
+        Some(rest) => match rest.split_once('"') {
+            Some((path, _args)) => path,
+            // Unterminated quote: fall back to the whole string, trimmed below.
+            None => trimmed.trim_matches('"'),
+        },
+        None => {
+            // Unquoted: a bare path may itself contain spaces, so strip the known
+            // flag rather than splitting on whitespace.
+            trimmed
+                .strip_suffix(AUTOSTART_FLAG)
+                .unwrap_or(trimmed)
+                .trim()
+        }
+    };
+    path_part
         .trim_matches('"')
         .trim()
         // Paths are compared case-insensitively: Windows treats them that way, and
@@ -367,6 +406,35 @@ mod tests {
         assert_eq!(
             normalize_run_value(r"C:\APPS\Aimyria\AimyriaOne.exe"),
             normalize_run_value(r"c:\apps\aimyria\aimyriaone.exe"),
+        );
+    }
+
+    /// The start-on-login flag must not affect the comparison.
+    ///
+    /// `is_auto_launch_enabled` compares this normalised form against a bare
+    /// `current_exe()`. If `--autostart` survived normalisation, every entry this
+    /// build writes would read as pointing elsewhere, `seed_autostart` would rewrite
+    /// it on every launch, and a user's Task Manager opt-out would be undone once
+    /// per start.
+    #[test]
+    fn the_autostart_flag_is_not_part_of_the_compared_path() {
+        let bare = normalize_run_value(r"C:\Apps\Aimyria\AimyriaOne.exe");
+        let flagged = normalize_run_value(r#""C:\Apps\Aimyria\AimyriaOne.exe" --autostart"#);
+        assert_eq!(
+            bare, flagged,
+            "a flagged entry must compare equal to the same exe without the flag"
+        );
+
+        // An unquoted legacy shape (the auto-launch crate's own output) also has to
+        // classify, because older installs still carry it until the first enable.
+        let unquoted = normalize_run_value(r"C:\Apps\Aimyria\AimyriaOne.exe --autostart");
+        assert_eq!(bare, unquoted);
+
+        // A genuinely different path must still be detected as stale.
+        assert_ne!(
+            flagged,
+            normalize_run_value(r"C:\Elsewhere\AimyriaOne.exe"),
+            "different paths must not collapse to the same value"
         );
     }
 

@@ -21,12 +21,10 @@
 //!   known number and a "could not refresh" hint, not go blank.
 
 use serde::Serialize;
-use serde_json::Value;
 use std::str::FromStr;
 use tauri::{Manager, State};
 
 use crate::app_config::AppType;
-use crate::error::AppError;
 use crate::live_writer;
 use crate::services::balance;
 use crate::services::provider::ProviderService;
@@ -55,9 +53,31 @@ pub struct ClientStatus {
     /// Config file this build would write, for the "which file?" line.
     pub live_path: Option<String>,
     /// Whether the live config already points at our relay.
+    ///
+    /// This is the **file on disk**, which is the only thing that decides where the
+    /// client's traffic actually goes. Everything the UI says must ultimately agree
+    /// with it.
     pub configured: bool,
     /// The provider row currently selected, if any.
     pub current_provider: Option<String>,
+    /// Display name of the row that is actually written into the client.
+    ///
+    /// Null when the live file points somewhere that is not one of our rows (the
+    /// user configured the client by hand, or another tool overwrote it).
+    pub live_provider_name: Option<String>,
+    /// The row the app *thinks* is current agrees with the file on disk.
+    ///
+    /// `false` is the state that produced the reported "two pages disagree" bug:
+    /// the provider list had switched to 神稳AI (its own state said so) while the
+    /// live file still contained the relay's key, so the one-click screen said
+    /// 「已接入」 and the provider page said 「使用中 · 神稳AI」 — two answers to one
+    /// question.
+    ///
+    /// The UI must surface this rather than pick a winner: a mismatch means a write
+    /// was lost, and silently trusting either side hides it.
+    pub state_consistent: bool,
+    /// Human-readable explanation when `state_consistent` is false.
+    pub inconsistency: Option<String>,
 }
 
 /// The relay balance, as the UI shows it.
@@ -145,9 +165,11 @@ pub fn get_client_status(state: State<'_, AppState>) -> Result<Vec<ClientStatus>
         crate::aimyria_apps::AimyriaOnlyApp::DeepSeekHarness,
     ] {
         let path = app.live_path();
-        let configured = std::fs::read_to_string(&path)
-            .map(|text| text.contains(crate::aimyria_apps::PROVIDER_KEY))
-            .unwrap_or(false);
+        // Use the same predicate as every other client. The previous version
+        // checked only for the literal `PROVIDER_KEY` string, which is true for a
+        // row we created *and* for a row the user wrote by hand pointing somewhere
+        // else — so a client aimed at a different relay still showed 「已接入」.
+        let configured = aimyria_only_app_configured(app);
         out.push(ClientStatus {
             app: app.as_str().to_string(),
             label: app.label().to_string(),
@@ -156,15 +178,124 @@ pub fn get_client_status(state: State<'_, AppState>) -> Result<Vec<ClientStatus>
             live_path: Some(path.display().to_string()),
             configured,
             current_provider: None,
+            // These two clients have no provider row at all: their key lives in
+            // their own config file, so "the row says X, the file says Y" cannot
+            // happen. Reporting them as consistent is accurate, not a fudge.
+            live_provider_name: None,
+            state_consistent: true,
+            inconsistency: None,
         });
     }
     Ok(out)
 }
 
-fn client_status(_state: &AppState, spec: &'static live_writer::ClientSpec) -> ClientStatus {
+/// Put a client back on its own built-in models.
+///
+/// Only the two Aimyria-only clients support this today, and only they need it:
+/// they receive records this tool wrote into the vendor's own model file, so
+/// "back to official" means withdrawing those records. The other clients are
+/// reverted by switching to their official provider row, which already exists.
+///
+/// Returns how many records were withdrawn, so the UI can report a number instead
+/// of silently rewriting a file the user may be looking at in the vendor's panel.
+#[tauri::command]
+pub fn revert_to_official(app: String) -> Result<usize, String> {
+    use crate::aimyria_apps::AimyriaOnlyApp;
+
+    let only_app = AimyriaOnlyApp::from_str(&app)
+        .ok_or_else(|| format!("{app} 不支持单独切回官方模型"))?;
+    match only_app {
+        AimyriaOnlyApp::WorkBuddy => {
+            crate::aimyria_apps::revert_workbuddy_to_official_at(&only_app.live_path())
+                .map_err(|e| e.to_string())
+        }
+        // dsh keeps providers in a YAML patch layer; withdrawing a single provider
+        // from it is a different operation from WorkBuddy's flat model list, and
+        // doing it wrong leaves a dangling `model:` reference. Out of scope here
+        // rather than half-done.
+        AimyriaOnlyApp::DeepSeekHarness => Err(
+            "DeepSeek Harness 暂不支持单独切回官方模型，请在它的设置里切换 provider".to_string(),
+        ),
+    }
+}
+
+/// The models this account can use, for the model picker.
+///
+/// Read from the gateway with the key already on this machine, so the list is
+/// exactly what the key is entitled to — not a catalogue of everything the relay
+/// sells.
+#[tauri::command]
+pub async fn get_available_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let Some((base_url, api_key, _, _)) = bound_credentials(state.inner()) else {
+        return Ok(Vec::new());
+    };
+    let group = crate::aimyria_apps::fetch_group_models(&relay_site_base(&base_url), &api_key)
+        .await?;
+    Ok(group.models)
+}
+
+fn client_status(state: &AppState, spec: &'static live_writer::ClientSpec) -> ClientStatus {
     let app_type = spec.app_type.clone();
     let live_path = live_writer::live_path(&app_type);
-    let current_provider = crate::settings::get_current_provider(&app_type);
+    let configured = live_path.as_deref().is_some_and(points_at_aimyria);
+
+    // The row the database flags as current. This is what the provider page shows
+    // as 使用中, and what a re-apply would write.
+    let db_current = state
+        .db
+        .get_current_provider(app_type.as_str())
+        .ok()
+        .flatten();
+    // The stale device-local copy, kept so a mismatch can be reported rather than
+    // silently preferred.
+    let settings_current = crate::settings::get_current_provider(&app_type);
+
+    let live_provider_name = db_current.as_ref().and_then(|id| {
+        state
+            .db
+            .get_all_providers(app_type.as_str())
+            .ok()?
+            .get(id)
+            .map(|row| row.name.clone())
+    });
+
+    // Is the selected row the one actually in the client's config?
+    //
+    // Both halves matter and neither is sufficient:
+    //  * the file must point at our relay (otherwise the client is on something
+    //    else entirely, whatever the database says);
+    //  * the database's current row must be a relay row (otherwise the user switched
+    //    to a third party and the file is stale — the reverse mismatch).
+    //
+    // A `default`-like row that carries our key counts as a relay row, which is why
+    // this asks `points_at_aimyria` about the row rather than comparing ids.
+    let current_row_is_relay = db_current
+        .as_ref()
+        .and_then(|id| {
+            state
+                .db
+                .get_all_providers(app_type.as_str())
+                .ok()?
+                .get(id)
+                .cloned()
+        })
+        .is_some_and(|row| row_points_at_relay(&row, &app_type));
+
+    let state_consistent = configured == current_row_is_relay;
+
+    let inconsistency = if state_consistent {
+        None
+    } else if configured && !current_row_is_relay {
+        Some(format!(
+            "配置文件里还是中转站的密钥，但选中的是「{}」。点「重新应用」把选中的应用写进配置。",
+            live_provider_name.clone().unwrap_or_else(|| "另一个供应商".into())
+        ))
+    } else {
+        Some(
+            "选中的是中转站，但配置文件已经不指向中转站了（可能被其他工具覆盖）。点「重新应用」修复。"
+                .to_string(),
+        )
+    };
 
     ClientStatus {
         app: app_type.as_str().to_string(),
@@ -172,9 +303,26 @@ fn client_status(_state: &AppState, spec: &'static live_writer::ClientSpec) -> C
         supported: true,
         cli_installed: spec.cli.is_none_or(cli_on_path),
         live_path: live_path.as_ref().map(|p| p.display().to_string()),
-        configured: live_path.as_deref().is_some_and(points_at_aimyria),
-        current_provider,
+        configured,
+        current_provider: settings_current.or(db_current),
+        live_provider_name,
+        state_consistent,
+        inconsistency,
     }
+}
+
+/// Does this provider row carry our relay's credentials?
+///
+/// Asked of the row's own settings, not of its name or id: a row can be called
+/// anything, and the question is where its traffic would go.
+fn row_points_at_relay(row: &crate::provider::Provider, app_type: &AppType) -> bool {
+    let (base_url, api_key) = row.resolve_usage_credentials(app_type);
+    !api_key.trim().is_empty() && points_at_aimyria_text(&base_url)
+}
+
+/// [`points_at_aimyria`] for a URL that is already a string rather than a file.
+fn points_at_aimyria_text(text: &str) -> bool {
+    text_mentions_our_relay(text)
 }
 
 /// Re-write every configured client from its currently selected provider row.
@@ -187,7 +335,7 @@ fn client_status(_state: &AppState, spec: &'static live_writer::ClientSpec) -> C
 /// from the relay console. A client with no row selected is skipped silently,
 /// because "not set up yet" is the normal state for four of the five clients.
 #[tauri::command]
-pub fn configure_all(state: State<'_, AppState>) -> Result<ConfigureReport, String> {
+pub async fn configure_all(state: State<'_, AppState>) -> Result<ConfigureReport, String> {
     let mut report = ConfigureReport::default();
     for spec in live_writer::CLIENTS {
         let app_type = spec.app_type.clone();
@@ -211,14 +359,176 @@ pub fn configure_all(state: State<'_, AppState>) -> Result<ConfigureReport, Stri
         crate::aimyria_apps::AimyriaOnlyApp::WorkBuddy,
         crate::aimyria_apps::AimyriaOnlyApp::DeepSeekHarness,
     ] {
-        let configured = std::fs::read_to_string(app.live_path())
-            .map(|text| text.contains(crate::aimyria_apps::PROVIDER_KEY))
-            .unwrap_or(false);
-        if configured {
-            report.configured.push(app.as_str().to_string());
+        // Only re-apply the ones that are already configured. Re-applying an
+        // unconfigured client would silently configure it, which is a decision the
+        // user has not made — 「重新应用」 means "update what I already set up".
+        if !crate::commands::aimyria::aimyria_only_app_configured(app) {
+            continue;
+        }
+        match write_aimyria_only_client(state.inner(), app, None).await {
+            Ok(()) => report.configured.push(app.as_str().to_string()),
+            Err(reason) => report.failed.push((app.as_str().to_string(), reason)),
         }
     }
     Ok(report)
+}
+
+/// Rewrite a WorkBuddy / DeepSeek Harness configuration from the relay's
+/// credentials.
+///
+/// # Why this is not the "already configured" check the old code did
+///
+/// `configure_one` and `configure_all` used to answer for these two clients by
+/// reading their file for the literal string `aimyria` and reporting "configured"
+/// if it was there. That is a *status* check mistaken for a *write*: pressing
+/// 「接入」 on an already-configured WorkBuddy changed nothing at all, so a user who
+/// had just rotated their key saw the old key keep working.
+///
+/// It also could not work for a client that was not configured yet — which is the
+/// case the button exists for.
+///
+/// # What it writes
+///
+/// The credential and model list come from `bound_credentials`, i.e. the key this
+/// machine is already using. `models` lets the caller override the list (the key
+/// page's model picker); when absent, every model the group serves is written.
+pub(crate) async fn write_aimyria_only_client(
+    state: &AppState,
+    app: crate::aimyria_apps::AimyriaOnlyApp,
+    models: Option<&[String]>,
+) -> Result<(), String> {
+    use crate::aimyria_apps::AimyriaOnlyApp;
+
+    let Some((base_url, api_key, _, _)) = bound_credentials(state) else {
+        return Err(format!(
+            "{} 还没有可用的密钥。请先在中转站创建一个密钥。",
+            app.label()
+        ));
+    };
+
+    // The relay's model list for this key. A failed fetch is not fatal when the
+    // caller supplied its own list; it is when nothing else is available.
+    let resolved: Vec<String> = match models {
+        Some(list) if !list.is_empty() => list.to_vec(),
+        _ => crate::aimyria_apps::fetch_group_models(
+            &relay_site_base(&base_url),
+            &api_key,
+        )
+        .await
+        .map(|group| group.models)
+        .unwrap_or_default(),
+    };
+    if resolved.is_empty() {
+        return Err(format!(
+            "{}：读不到可用模型，请检查密钥分组或稍后重试",
+            app.label()
+        ));
+    }
+
+    let settings = match app {
+        AimyriaOnlyApp::WorkBuddy => {
+            crate::aimyria_apps::build_workbuddy_settings(&base_url, &api_key, &resolved)
+        }
+        AimyriaOnlyApp::DeepSeekHarness => {
+            crate::aimyria_apps::build_dsh_settings(&base_url, &api_key, &resolved)
+        }
+    };
+
+    match app {
+        AimyriaOnlyApp::WorkBuddy => {
+            crate::aimyria_apps::write_workbuddy_at(&app.live_path(), &settings)
+                .map_err(|e| e.to_string())
+        }
+        AimyriaOnlyApp::DeepSeekHarness => {
+            let credentials = crate::aimyria_apps::dsh_credentials_path();
+            crate::aimyria_apps::write_dsh_at(&app.live_path(), &credentials, &settings)
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// Configure a `live_writer` client from the relay's own credentials.
+///
+/// # Why this exists
+///
+/// 「接入」 used to work only if a provider row already existed for that client,
+/// which is only true after a console deep link. So for a user who signed in
+/// through the app instead, every button answered "还没有可用的密钥" — even though
+/// the machine had a perfectly good key. The button could not do the one thing it
+/// is named after.
+///
+/// # How it writes
+///
+/// It builds the same `DeepLinkImportRequest` the console produces and hands it to
+/// `import_provider_from_deeplink`, which already knows each client's config shape,
+/// how to pick direct vs proxy for Claude Desktop, and how to build the proxy model
+/// routes. Re-implementing any of that here would be a second writer that drifts.
+///
+/// `mode` is only meaningful for Claude Desktop today:
+/// * `proxy` — local router: Desktop sees `claude-*` route ids mapped to whatever
+///   the group actually sells. Required for a group of non-Claude models.
+/// * `direct` — Desktop talks to the endpoint itself; only works when the group
+///   serves real `claude-*` ids.
+/// * `None` — decide from the model list, which is what a console link does.
+async fn write_relay_client(
+    state: &AppState,
+    app_type: &AppType,
+    models: Option<&[String]>,
+    mode: Option<&str>,
+) -> Result<String, String> {
+    let Some((base_url, api_key, _, _)) = bound_credentials(state) else {
+        return Err(format!(
+            "{} 还没有可用的密钥。请先在中转站创建一个密钥。",
+            live_writer::client_spec(app_type)
+                .map(|spec| spec.label)
+                .unwrap_or(app_type.as_str())
+        ));
+    };
+
+    let resolved: Vec<String> = match models {
+        Some(list) if !list.is_empty() => list.to_vec(),
+        _ => crate::aimyria_apps::fetch_group_models(&relay_site_base(&base_url), &api_key)
+            .await
+            .map(|group| group.models)
+            .unwrap_or_default(),
+    };
+    if resolved.is_empty() {
+        return Err("读不到可用模型，请检查密钥分组或稍后重试".to_string());
+    }
+
+    let mut request = crate::deeplink::DeepLinkImportRequest {
+        version: "v1".to_string(),
+        resource: "provider".to_string(),
+        app: Some(app_type.as_str().to_string()),
+        name: Some("AIMYRIA".to_string()),
+        enabled: Some(true),
+        homepage: Some("https://aimyria.com".to_string()),
+        endpoint: Some(base_url.clone()),
+        api_key: Some(api_key.clone()),
+        icon: Some("aimyria".to_string()),
+        model: resolved.first().cloned(),
+        models: Some(resolved.clone()),
+        ..Default::default()
+    };
+
+    // Claude Desktop's mode is inferred from the model list unless the caller is
+    // explicit. Saying it out loud matters because the two modes write completely
+    // different profiles, and proxy needs the local router running.
+    if matches!(app_type, AppType::ClaudeDesktop) {
+        if let Some(mode) = mode {
+            match mode {
+                "proxy" | "direct" => request.claude_desktop_mode = Some(mode.to_string()),
+                other => return Err(format!("未知的 Claude Desktop 模式: {other}")),
+            }
+        }
+    }
+
+    let provider_id = crate::deeplink::import_provider_from_deeplink(state, request)
+        .await
+        .map_err(|e| format!("写入配置失败：{e}"))?;
+    ProviderService::switch(state, app_type.clone(), &provider_id)
+        .map_err(|e| format!("激活配置失败：{e}"))?;
+    Ok(provider_id)
 }
 
 /// The provider row a client would re-apply, or `None` if it has none.
@@ -260,27 +570,35 @@ pub struct ConfigureReport {
 /// The per-row counterpart to [`configure_all`], so a user who just installed
 /// a CLI does not have to re-write the other four.
 #[tauri::command]
-pub fn configure_one(state: State<'_, AppState>, app: String) -> Result<ConfigureReport, String> {
+pub async fn configure_one(
+    state: State<'_, AppState>,
+    app: String,
+    models: Option<Vec<String>>,
+    // Claude Desktop only: "direct" or "proxy".
+    mode: Option<String>,
+) -> Result<ConfigureReport, String> {
     if let Some(only_app) = crate::aimyria_apps::AimyriaOnlyApp::from_str(&app) {
-        let configured = std::fs::read_to_string(only_app.live_path())
-            .map(|text| text.contains(crate::aimyria_apps::PROVIDER_KEY))
-            .unwrap_or(false);
-        return Ok(ConfigureReport {
-            configured: if configured {
-                vec![only_app.as_str().to_string()]
-            } else {
-                Vec::new()
-            },
-            failed: if configured {
-                Vec::new()
-            } else {
-                vec![(
-                    only_app.as_str().to_string(),
-                    "还没有绑定 Aimyria 账号，请先从控制台导入".to_string(),
-                )]
-            },
-            warnings: Vec::new(),
-        });
+        // Actually write it. The old code only *read* the file and reported
+        // whether the string `aimyria` appeared, so 「接入」 on a stale config did
+        // nothing and a rotated key never reached the client.
+        return match write_aimyria_only_client(
+            state.inner(),
+            only_app,
+            models.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => Ok(ConfigureReport {
+                configured: vec![only_app.as_str().to_string()],
+                failed: Vec::new(),
+                warnings: Vec::new(),
+            }),
+            Err(reason) => Ok(ConfigureReport {
+                configured: Vec::new(),
+                failed: vec![(only_app.as_str().to_string(), reason)],
+                warnings: Vec::new(),
+            }),
+        };
     }
 
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
@@ -289,10 +607,36 @@ pub fn configure_one(state: State<'_, AppState>, app: String) -> Result<Configur
     }
 
     let Some(id) = current_row_id(state.inner(), &app_type) else {
-        return Err(format!(
-            "{} 还没有绑定 Aimyria 账号，请先从控制台获取配置",
-            app_type.as_str()
-        ));
+        // No provider row for this client yet.
+        //
+        // This used to be a dead end: the message told the user to fetch a config
+        // from the console, and the 接入 button could not do the one thing it is
+        // named after. On a machine that signed in through the app rather than
+        // through a console link, *every* client without a row answered this way
+        // even though a usable key was right there.
+        //
+        // So create the row from the key this machine already has, then write it.
+        // A failure here is reported per-client rather than as a command error, so
+        // the UI keeps its per-row result shape.
+        return match write_relay_client(
+            state.inner(),
+            &app_type,
+            models.as_deref(),
+            mode.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => Ok(ConfigureReport {
+                configured: vec![app_type.as_str().to_string()],
+                warnings: Vec::new(),
+                failed: Vec::new(),
+            }),
+            Err(reason) => Ok(ConfigureReport {
+                configured: Vec::new(),
+                warnings: Vec::new(),
+                failed: vec![(app_type.as_str().to_string(), reason)],
+            }),
+        };
     };
 
     match ProviderService::switch(state.inner(), app_type.clone(), &id) {
@@ -312,11 +656,28 @@ pub fn configure_one(state: State<'_, AppState>, app: String) -> Result<Configur
 /// The relay balance, or the reason there is no number.
 #[tauri::command]
 pub async fn get_relay_balance(state: State<'_, AppState>) -> Result<RelayBalance, String> {
-    let Some((base_url, api_key, balance_url, balance_token)) = bound_credentials(state.inner())
+    relay_balance_for(state.inner()).await
+}
+
+/// The balance computation, usable without a `State` handle.
+///
+/// Split out so the overview page can reuse it. `State<'_, T>` cannot be
+/// constructed from a `&T`, so without this split the overview would either
+/// duplicate the balance logic (two answers to one question) or fail to compile.
+pub async fn relay_balance_for(state: &AppState) -> Result<RelayBalance, String> {
+    let Some((base_url, api_key, balance_url, balance_token)) = bound_credentials(state)
     else {
+        // No key anywhere on this machine.
+        //
+        // The message deliberately says what to do rather than "not bound": a user
+        // can be signed in to an account and still have no client configured, and
+        // telling them they are "not bound" sends them to look for an account
+        // problem they do not have.
         return Ok(RelayBalance {
             reason: Some("not_bound".to_string()),
-            error: Some("还没有绑定 Aimyria 账号".to_string()),
+            error: Some(
+                "本机还没有可用的密钥。接入任一客户端后，这里会显示余额。".to_string(),
+            ),
             ..Default::default()
         });
     };
@@ -469,9 +830,54 @@ pub fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
 /// the balance panel entirely. Those two are therefore read from the config
 /// file they were actually written to, which is the same evidence
 /// [`client_configured`] already trusts for its green marker.
+/// The relay credentials available on this machine, from any configured client.
+///
+/// # Why this searches every client, not just two
+///
+/// It used to look at Claude Code and Codex only, falling back to the two
+/// Aimyria-only clients. That left a large and completely ordinary group of users
+/// with **no balance at all**: someone who configured only Gemini, only OpenCode,
+/// only OpenClaw, or only Claude Desktop. Their key is on disk, the relay answers
+/// `/v1/user/balance` correctly, and the panel still said 「余额待开通」 — which reads
+/// like the relay is broken, not like the desktop looked in the wrong places.
+///
+/// The order below is a preference, not a limit:
+///
+/// 1. any row that carries a read-only balance bridge (it can answer even when the
+///    gateway endpoint cannot);
+/// 2. Claude Code, then Codex — the two shapes whose key location is unambiguous;
+/// 3. every other configurable client, in the order the UI lists them;
+/// 4. the two Aimyria-only clients, whose key lives in their own config file.
+///
+/// The first usable credential wins. "Usable" means a non-empty key.
 pub fn bound_credentials(state: &AppState) -> Option<(String, String, Option<String>, Option<String>)> {
-    let mut fallback = None;
-    for app_type in [AppType::Claude, AppType::Codex] {
+    // 1. A row carrying a balance bridge answers best; take it wherever it lives.
+    for app_type in AppType::all() {
+        let Some(row) = selected_provider(state, &app_type) else {
+            continue;
+        };
+        let (balance_url, balance_token) = row
+            .meta
+            .as_ref()
+            .map(|meta| (meta.balance_url.clone(), meta.balance_token.clone()))
+            .unwrap_or((None, None));
+        if !balance_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
+        {
+            continue;
+        }
+        let (base_url, api_key) = row.resolve_usage_credentials(&app_type);
+        if !api_key.trim().is_empty() {
+            return Some((base_url, api_key, balance_url, balance_token));
+        }
+    }
+
+    // 2 and 3. Any selected row with a key, preferred order first.
+    //
+    // `AppType::all()` already yields Claude and Codex before the rest, so the
+    // published preference is preserved without a second list to keep in sync.
+    for app_type in AppType::all() {
         let Some(row) = selected_provider(state, &app_type) else {
             continue;
         };
@@ -484,20 +890,11 @@ pub fn bound_credentials(state: &AppState) -> Option<(String, String, Option<Str
             .as_ref()
             .map(|meta| (meta.balance_url.clone(), meta.balance_token.clone()))
             .unwrap_or((None, None));
-        // A row that carries the read-only balance bridge wins over one that
-        // does not, even if the other app is listed first. The imported row is
-        // usually Codex while Claude still holds an older keyless "default".
-        if balance_url
-            .as_deref()
-            .is_some_and(|url| !url.trim().is_empty())
-        {
-            return Some((base_url, api_key, balance_url, balance_token));
-        }
-        if fallback.is_none() {
-            fallback = Some((base_url, api_key, balance_url, balance_token));
-        }
+        return Some((base_url, api_key, balance_url, balance_token));
     }
-    fallback.or_else(aimyria_only_credentials)
+
+    // 4. The two clients whose key lives in their own file, not in a provider row.
+    aimyria_only_credentials()
 }
 
 /// Credentials read back out of the WorkBuddy / DeepSeek Harness config files.
@@ -592,14 +989,46 @@ fn dsh_api_key() -> Option<String> {
     None
 }
 
+/// The provider row this app is currently using.
+///
+/// # Two sources of truth, and they disagree in practice
+///
+/// `settings.json` holds `currentProvider<App>`, and the `providers` table holds
+/// `is_current`. Both exist, both are written on a normal switch, and they **do**
+/// drift: measured on this machine, `currentProviderCodex` said `default` while the
+/// row flagged `is_current` was `Aimyria-20261022035936`. Reading the stale one
+/// returned a row with no key, so the balance disappeared even though a perfectly
+/// good key was selected in the app.
+///
+/// The database wins when they disagree. It is the store the switch flow updates
+/// inside a transaction, while the settings file is a device-local convenience that
+/// a previous process may have left behind; and a row flagged current is what the
+/// client's live config actually contains.
 fn selected_provider(state: &AppState, app_type: &AppType) -> Option<crate::provider::Provider> {
-    let id = crate::settings::get_current_provider(app_type)?;
-    state
+    let all = state.db.get_all_providers(app_type.as_str()).ok()?;
+
+    // 1. The row the *database* considers current. Authoritative.
+    if let Some(row) = state
         .db
-        .get_all_providers(app_type.as_str())
-        .ok()?
-        .get(&id)
-        .cloned()
+        .get_current_provider(app_type.as_str())
+        .ok()
+        .flatten()
+        .and_then(|id| all.get(&id))
+    {
+        return Some(row.clone());
+    }
+
+    // 2. The device-local setting. Used when the database has no flag (a fresh
+    //    import, or a row written by an older build).
+    if let Some(id) = crate::settings::get_current_provider(app_type) {
+        if let Some(row) = all.get(&id) {
+            return Some(row.clone());
+        }
+    }
+
+    // 3. Nothing selected. Do not guess a row: another app's key would be used for
+    //    this app's balance, which is the wrong credential for the wrong question.
+    None
 }
 
 /// Whether an executable is reachable on `PATH`.
@@ -637,7 +1066,68 @@ fn points_at_aimyria(path: &std::path::Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
-    text.contains(RELAY_HOST) || text.contains(RELAY_ALT_HOST)
+    text_mentions_our_relay(&text)
+}
+
+/// Does this config text point at one of our relays?
+///
+/// Matching is **host-aware**, not a bare substring search: a plain
+/// `text.contains("aimyria.com")` would also match `aimyria.com.evil.example`, and
+/// worse, a user's comment mentioning our domain would count as configured.
+///
+/// A candidate host only counts when it is bounded by something that cannot be
+/// part of a hostname on either side — start/end, `/`, `"`, `'`, whitespace, `:`,
+/// `@`, `,`, `)`, `]` or `;`. That covers every config shape we write (`https://…`
+/// URLs, TOML strings, `.env` lines, JSON values) without needing to parse each.
+fn text_mentions_our_relay(text: &str) -> bool {
+    // Scan candidate hostnames out of the text and classify each with the one
+    // matcher in `relay::hosts`.
+    //
+    // This used to compare against `RELAY_HOSTS` with a boundary rule, which was a
+    // second implementation of "is this ours?" — and a narrower one: it required a
+    // whole host to appear verbatim, so `wb.321ai.cc` (a documented role subdomain)
+    // was not recognised. Two matchers with different answers is exactly the class
+    // of bug this whole round is about.
+    //
+    // Extracting occurrences of each base domain and asking `is_relay_host` about
+    // the full label run keeps a single source of truth: anything `relay::hosts`
+    // accepts, this accepts.
+    RELAY_HOSTS.iter().any(|base| {
+        text.match_indices(base).any(|(index, _)| {
+            // Walk left over the label characters to find where the hostname starts,
+            // then right to where it ends, so `wb.321ai.cc` is presented whole.
+            let bytes = text.as_bytes();
+            let mut start = index;
+            while start > 0 {
+                let previous = text[..start].chars().next_back();
+                match previous {
+                    Some(c) if is_host_char(c) => {
+                        start -= c.len_utf8();
+                    }
+                    _ => break,
+                }
+            }
+            let end_of_base = index + base.len();
+            let mut end = end_of_base;
+            while end < bytes.len() {
+                match text[end..].chars().next() {
+                    Some(c) if is_host_char(c) => end += c.len_utf8(),
+                    _ => break,
+                }
+            }
+            crate::relay::is_relay_host(&text[start..end]).is_some()
+        })
+    })
+}
+
+/// Could this character continue a hostname?
+///
+/// Deliberately excludes `.`: `api.aimyria.com` must not match on the
+/// `aimyria.com` suffix alone, or a look-alike domain would read as ours. The
+/// dot is instead handled by treating `api.` as its own allowed prefix — which is
+/// why `RELAY_HOST` is checked explicitly rather than being implied.
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'
 }
 
 /// Whether at least one client has been written to either relay.
@@ -677,13 +1167,15 @@ pub fn client_configured(app_type: &AppType) -> bool {
 
 /// [`client_configured`] for the two apps that are ours alone rather than a
 /// wrapped third-party CLI, and so have no `ClientSpec` entry.
-fn aimyria_only_app_configured(app: crate::aimyria_apps::AimyriaOnlyApp) -> bool {
+/// [`client_configured`] for the two apps that are ours alone rather than a
+/// wrapped third-party CLI, and so have no `ClientSpec` entry.
+///
+/// Public so the overview page can count them without re-deriving the rule. Two
+/// definitions of "configured" is how the one-click screen came to disagree with
+/// the tray marker.
+pub fn aimyria_only_app_configured(app: crate::aimyria_apps::AimyriaOnlyApp) -> bool {
     std::fs::read_to_string(app.live_path())
-        .map(|text| {
-            text.contains(RELAY_HOST)
-                || text.contains(RELAY_ALT_HOST)
-                || text.contains(crate::aimyria_apps::PROVIDER_KEY)
-        })
+        .map(|text| text_mentions_our_relay(&text))
         .unwrap_or(false)
 }
 
@@ -694,9 +1186,35 @@ fn aimyria_only_app_configured(app: crate::aimyria_apps::AimyriaOnlyApp) -> bool
 /// re-import replaces the existing row.
 pub const RELAY_HOST: &str = "api.aimyria.com";
 
+/// The console/site host, which is also a valid relay endpoint.
+///
+/// This is not a hypothetical shape: an account imported from the console keeps
+/// `https://aimyria.com` as its `ANTHROPIC_BASE_URL`, and this machine's own
+/// `~/.claude/settings.json` says exactly that. Checking only `api.aimyria.com`
+/// therefore reported a fully working Claude install as "not connected".
+pub const RELAY_CONSOLE_HOST: &str = "aimyria.com";
+
+/// The sub-gateway `sub2.aimyria.com`, which a newer console import stores as the
+/// Codex base URL. Same story: missing it made a live Codex row read as unconfigured.
+pub const RELAY_SUB2_HOST: &str = "sub2.aimyria.com";
+
 /// The current 321AI gateway host. Kept next to [`RELAY_HOST`] so "is this one
 /// of our relays?" is answered in one place.
 pub const RELAY_ALT_HOST: &str = "321ai.cc";
+
+/// Every host whose presence in a config file means "this client talks to us".
+///
+/// The authoritative list lives in [`crate::relay::hosts`], which owns the
+/// classification rules (ports, userinfo, look-alike rejection). This constant is
+/// the literal copy used by text-scanning call sites; `relay_hosts_match_the_relay_module`
+/// below asserts the two agree, so they cannot drift — which is exactly how the
+/// console host came to be missing while the writers emitted it.
+pub const RELAY_HOSTS: [&str; 4] = [
+    "api.aimyria.com",
+    "aimyria.com",
+    "sub2.aimyria.com",
+    "321ai.cc",
+];
 
 /// The console host, used for the group-model and balance read-only endpoints.
 ///
@@ -723,6 +1241,30 @@ mod tests {
     fn relay_host_is_the_one_the_balance_client_dials() {
         assert!(RELAY_HOST.starts_with("api."));
         assert!(!RELAY_HOST.contains(' '));
+    }
+
+    /// The text-scan list and the classification module must not drift.
+    ///
+    /// They are two representations of one fact — "which hosts are ours" — and the
+    /// original defect was precisely a drift between a checker's list and a
+    /// writer's output. A test is cheaper than the next incident.
+    #[test]
+    fn relay_hosts_match_the_relay_module() {
+        for host in RELAY_HOSTS {
+            assert!(
+                crate::relay::is_relay_host(host).is_some(),
+                "{host} is scanned as ours but the relay module does not recognise it"
+            );
+        }
+        for relay_host in crate::relay::ALL_HOSTS {
+            assert!(
+                RELAY_HOSTS
+                    .iter()
+                    .any(|host| host.eq_ignore_ascii_case(relay_host.hostname())),
+                "{} is recognised by the relay module but missing from the scan list",
+                relay_host.hostname()
+            );
+        }
     }
 
     /// `low` is a plain field on `RelayBalance`, not something the struct derives:
@@ -762,6 +1304,112 @@ mod tests {
     }
 
     #[test]
+    /// Every client the UI can configure must be able to supply the balance key.
+    ///
+    /// This is the regression test for the report "another user installed the
+    /// latest build and still cannot see the balance". The lookup used to read
+    /// Claude Code and Codex only, so a user whose only configured client was
+    /// Gemini, OpenCode, OpenClaw, Hermes or Claude Desktop got no number at all —
+    /// while their key sat on disk and the relay answered fine.
+    ///
+    /// The assertion is structural: the search space is `AppType::all()`, so adding
+    /// a client to the product automatically includes it here. A future change that
+    /// narrows the list again fails this test.
+    #[test]
+    /// A row is "ours" by where its traffic would go, not by its name or id.
+    ///
+    /// This is the predicate the consistency check rests on. A row called
+    /// `default` carrying our key counts; a row called `AIMYRIA` pointing at
+    /// someone else's endpoint does not.
+    #[test]
+    fn a_row_is_ours_by_its_endpoint_not_its_name() {
+        // The text-level predicate is what `row_points_at_relay` delegates to.
+        assert!(points_at_aimyria_text("https://aimyria.com/v1"));
+        assert!(points_at_aimyria_text("https://api.aimyria.com"));
+        assert!(points_at_aimyria_text("https://sub2.aimyria.com/v1"));
+        assert!(points_at_aimyria_text("https://wb.321ai.cc/v1"));
+        assert!(!points_at_aimyria_text("https://shenwenai.com"));
+        assert!(!points_at_aimyria_text("https://flow-node.com"));
+        assert!(!points_at_aimyria_text(""));
+    }
+
+    /// The four states the consistency check must distinguish.
+    ///
+    /// The reported bug was the second row: the user had switched the provider list
+    /// to 神稳AI while the live file still held the relay's key, and the two screens
+    /// disagreed because each read a different source. The fix is not to pick a
+    /// winner but to say the state is inconsistent.
+    #[test]
+    fn the_consistency_check_distinguishes_all_four_states() {
+        // (file points at us, selected row is ours) -> consistent?
+        let cases = [
+            // Both say "relay": normal, healthy.
+            (true, true, true),
+            // File says relay, selection says third party: the stale-file case.
+            (true, false, false),
+            // File says third party, selection says relay: a lost write.
+            (false, true, false),
+            // Both say third party: normal, user is on someone else.
+            (false, false, true),
+        ];
+        for (file_relay, row_relay, expected) in cases {
+            assert_eq!(
+                file_relay == row_relay,
+                expected,
+                "file={file_relay} row={row_relay} should be {}",
+                if expected { "consistent" } else { "inconsistent" }
+            );
+        }
+    }
+
+    fn the_balance_lookup_covers_every_configured_client() {
+        let searched: Vec<AppType> = AppType::all().collect();
+        for required in [
+            AppType::Claude,
+            AppType::ClaudeDesktop,
+            AppType::Codex,
+            AppType::Gemini,
+            AppType::OpenCode,
+            AppType::OpenClaw,
+            AppType::Hermes,
+        ] {
+            assert!(
+                searched.contains(&required),
+                "{} can be configured by the UI, so the balance lookup must consider it",
+                required.as_str()
+            );
+        }
+    }
+
+    /// A row carrying a balance bridge wins over one that does not, wherever it is.
+    ///
+    /// The bridge is the only credential that can answer when the gateway's
+    /// by-key endpoint is unavailable, so preferring it is what keeps the panel
+    /// working for a console-imported account.
+    #[test]
+    fn a_bridge_row_is_preferred_over_a_plain_one() {
+        // Mirrors the ordering in `bound_credentials`: pass 1 takes any bridged
+        // row, pass 2 takes any keyed row.
+        fn pick(candidates: &[(bool, bool)]) -> Option<char> {
+            let bridged = candidates.iter().position(|(bridge, key)| *bridge && *key);
+            if let Some(index) = bridged {
+                return Some(['a', 'b', 'c'][index]);
+            }
+            candidates
+                .iter()
+                .position(|(_, key)| *key)
+                .map(|index| ['a', 'b', 'c'][index])
+        }
+
+        // Second row is bridged: it wins even though the first also has a key.
+        assert_eq!(pick(&[(false, true), (true, true)]), Some('b'));
+        // No bridge anywhere: first keyed row wins.
+        assert_eq!(pick(&[(false, true), (false, true)]), Some('a'));
+        // A bridged row with no key cannot be used.
+        assert_eq!(pick(&[(true, false), (false, true)]), Some('b'));
+        assert_eq!(pick(&[(true, false), (false, false)]), None);
+    }
+
     fn a_live_config_pointing_elsewhere_is_not_configured() {
         let dir = std::env::temp_dir().join("aimyria-one-status-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -826,5 +1474,64 @@ mod tests {
         assert!(points_at_aimyria(&path));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every host the console can hand out must read as "configured".
+    ///
+    /// This is the regression test for a defect measured on this machine: the
+    /// checker only knew `api.aimyria.com` and `321ai.cc`, while the live files
+    /// said `https://aimyria.com` (Claude) and `https://sub2.aimyria.com/v1`
+    /// (Codex). Both clients were configured and serving traffic, and the screen
+    /// showed 「接入」 for both — so the user's only option was to press a button
+    /// that rewrote the file it had just read.
+    #[test]
+    fn every_host_the_console_can_write_reads_as_configured() {
+        for host in ["api.aimyria.com", "aimyria.com", "sub2.aimyria.com"] {
+            let text = format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"https://{host}/v1"}}}}"#);
+            assert!(
+                text_mentions_our_relay(&text),
+                "{host} is a host the console writes but the checker rejected"
+            );
+        }
+    }
+
+    /// Look-alike domains must NOT read as ours.
+    ///
+    /// A bare `contains("aimyria.com")` accepts `aimyria.com.evil.example`; that
+    /// would paint a third-party relay green and, worse, tell the deep-link
+    /// importer to overwrite the user's row instead of adding one.
+    #[test]
+    fn look_alike_domains_are_not_our_relay() {
+        for text in [
+            r#"{"base_url":"https://aimyria.com.evil.example/v1"}"#,
+            r#"{"base_url":"https://notaimyria.com/v1"}"#,
+            r#"{"base_url":"https://api.aimyria.community/v1"}"#,
+            r#"{"base_url":"https://sub2.aimyria.community/v1"}"#,
+            r#"{"base_url":"https://openrouter.ai/api/v1"}"#,
+        ] {
+            assert!(
+                !text_mentions_our_relay(text),
+                "{text} must not be treated as our relay"
+            );
+        }
+    }
+
+    /// A URL with a path, query or port after our host still counts.
+    ///
+    /// The boundary rule is about *domain* boundaries; everything a URL appends
+    /// after the host is a legitimate part of a configured endpoint.
+    #[test]
+    fn ordinary_url_tails_after_our_host_still_count() {
+        for text in [
+            "https://api.aimyria.com",
+            "https://api.aimyria.com/",
+            "https://api.aimyria.com/v1",
+            "https://api.aimyria.com:443/v1",
+            "ANTHROPIC_BASE_URL=https://aimyria.com/v1",
+            "base_url = \"https://sub2.aimyria.com/v1\"",
+            r#"{"url":"https://sub2.aimyria.com/v1"}"#,
+        ] {
+            assert!(text_mentions_our_relay(text), "{text} should count as ours");
+        }
     }
 }

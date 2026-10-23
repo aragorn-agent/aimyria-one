@@ -280,6 +280,26 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let old_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
         let old_home = std::env::var_os("HOME");
+        // Hermes resolves its directory from `LOCALAPPDATA` on Windows, not from
+        // `HOME`. Leaving it ambient makes these tests read the developer's real
+        // `%LOCALAPPDATA%\hermes\config.yaml`: on a machine with AIMYRIA GO
+        // installed that file holds the user's own provider, so
+        // `import_hermes_providers_from_live` counted two providers where the test
+        // expected one.
+        //
+        // Measured: the test passes as soon as the real file is moved aside. That
+        // is what a test which reads user data looks like — it goes red on the
+        // machines that matter and green in CI, which is the worst possible split.
+        let old_local_appdata = std::env::var_os("LOCALAPPDATA");
+        let old_hermes_home = std::env::var_os("HERMES_HOME");
+        let hermes_home = temp.path().join("hermes-home");
+        std::fs::create_dir_all(&hermes_home).expect("seed isolated hermes home");
+        let local_appdata = temp.path().join("local-appdata");
+        std::fs::create_dir_all(&local_appdata).expect("seed isolated local appdata");
+        std::env::set_var("HERMES_HOME", &hermes_home);
+        // Pointed at an empty directory rather than removed: other paths
+        // (`dirs::data_local_dir`) treat absence as an error.
+        std::env::set_var("LOCALAPPDATA", &local_appdata);
         std::env::set_var("CC_SWITCH_TEST_HOME", temp.path());
         std::env::set_var("HOME", temp.path());
 
@@ -294,6 +314,14 @@ mod tests {
         match old_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
+        }
+        match old_local_appdata {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        match old_hermes_home {
+            Some(value) => std::env::set_var("HERMES_HOME", value),
+            None => std::env::remove_var("HERMES_HOME"),
         }
 
         result

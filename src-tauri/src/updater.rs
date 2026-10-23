@@ -120,6 +120,16 @@ const WATCH_TEST: Duration = Duration::from_secs(6);
 const REPLACE_DELAY_REAL: Duration = Duration::from_secs(15);
 const REPLACE_DELAY_TEST: Duration = Duration::from_millis(500);
 
+/// How many times to retry a rename that lost a race with an external file lock.
+///
+/// Covers scanner/indexer windows, which are the real cause of `os error 32` here.
+const RENAME_ATTEMPTS: u32 = 6;
+
+/// Pause between rename attempts. 100 ms doubling to ~3.2 s: long enough for a
+/// scanner to release a handle, short enough that a genuinely locked file fails
+/// inside the same round instead of hanging the update channel.
+const RENAME_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Prefix on every line this module writes, so an acceptance script can pull the
 /// whole narrative out of the log with one pattern.
 const TAG: &str = "[updater]";
@@ -319,33 +329,41 @@ pub fn with_cache_buster(raw: &str) -> String {
 
 /// Is a deep link stashed but not yet claimed?
 ///
-/// Separate from [`import_in_flight`] so the two signals can be logged
-/// individually when a round is deferred; "which one held it back" is a question
-/// worth being able to answer from the log alone.
+/// Separate from [`import_in_flight`] so the signal can be logged on its own when
+/// a round is deferred; "what held it back" is a question worth being able to
+/// answer from the log alone.
 fn deeplink_pending() -> bool {
     crate::deeplink::has_pending_deeplink()
 }
 
 /// Is a user part-way through the import flow?
 ///
-/// Two signals, both conservative:
+/// The only trustworthy signal is a deep link that was stashed and not yet
+/// claimed: the backend has recorded a request the UI has not shown, so a restart
+/// right now would lose the one instruction that binds an account.
 ///
-/// 1. a deep link stashed but not yet claimed — the backend recorded a request
-///    the UI has not shown yet, so a restart right now would lose it;
-/// 2. the window is visible — the import dialog opens the window, and nothing
-///    else about this tray app normally has it on screen.
+/// # Why the visible window is no longer a signal
 ///
-/// Either one holds the replacement. Neither is authoritative *forever* (a
-/// stashed link that is never claimed, a window left open for a chat), which is
-/// why the wait has a watchdog rather than blocking the update channel outright.
-fn import_in_flight(app: &AppHandle) -> bool {
-    if deeplink_pending() {
-        return true;
-    }
-    match app.get_webview_window("main") {
-        Some(window) => window.is_visible().unwrap_or(false),
-        None => false,
-    }
+/// It used to be, on the theory that "nothing else about this tray app normally
+/// has the window on screen". That theory is wrong in the way that matters: the
+/// window is visible **every time the user opens the app to look at something** —
+/// check a balance, switch a provider, read the settings. Measured on this machine,
+/// the update to v1.0.8 was held back 22 times by
+/// `holding the replacement: pending_deeplink=false window_visible=true`, and the
+/// installed copy stayed on v1.0.5 while the server served v1.0.8 for two days.
+///
+/// That is the exact user-visible failure this function used to cause: the app
+/// checks, finds an update, decides the user is "mid-import" because they happen
+/// to have the window open, holds for 30 minutes, gives up, waits six hours, and
+/// repeats. From the outside nothing is wrong — the log even says an update was
+/// available — and the machine silently never updates.
+///
+/// A visible window is not a reason to postpone a *replacement* either: the
+/// payload is already downloaded and verified, the restart saves window state
+/// first, and the import flow that genuinely must not be interrupted is the
+/// confirmation dialog — which is exactly what the stashed-link signal covers.
+fn import_in_flight(_app: &AppHandle) -> bool {
+    deeplink_pending()
 }
 
 /// What the pre-replace wait decided.
@@ -383,12 +401,8 @@ async fn wait_for_clear(app: &AppHandle, watchdog: Duration) -> WaitOutcome {
         }
         if !announced {
             log::info!(
-                "{TAG} holding the replacement: pending_deeplink={} window_visible={} \
-                 (up to {}s)",
+                "{TAG} holding the replacement: pending_deeplink={} (up to {}s)",
                 deeplink_pending(),
-                app.get_webview_window("main")
-                    .and_then(|w| w.is_visible().ok())
-                    .unwrap_or(false),
                 watchdog.as_secs()
             );
             announced = true;
@@ -518,14 +532,16 @@ async fn install_companions(
         if target.exists() {
             let backup = dir.join(format!("{name}.old"));
             let _ = std::fs::remove_file(&backup);
-            if let Err(e) = std::fs::rename(&target, &backup) {
+            if let Err(e) =
+                rename_with_retry(&target, &backup, RENAME_ATTEMPTS, RENAME_BACKOFF)
+            {
                 let _ = std::fs::remove_file(&staged);
                 return Err(format!(
                     "companion {name}: cannot move the existing file aside: {e}"
                 ));
             }
         }
-        if let Err(e) = std::fs::rename(&staged, &target) {
+        if let Err(e) = rename_with_retry(&staged, &target, RENAME_ATTEMPTS, RENAME_BACKOFF) {
             let _ = std::fs::remove_file(&staged);
             let backup = dir.join(format!("{name}.old"));
             if backup.exists() {
@@ -558,6 +574,61 @@ fn sha256_hex_of_file(path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Move `from` onto `to`, retrying transient sharing violations.
+///
+/// Only Windows produces `ERROR_SHARING_VIOLATION`/`ERROR_LOCK_VIOLATION` here;
+/// on Unix the first attempt either works or fails for a reason a retry cannot
+/// fix, so the loop degenerates to a single try.
+pub fn rename_with_retry(
+    from: &Path,
+    to: &Path,
+    attempts: u32,
+    backoff: Duration,
+) -> std::io::Result<()> {
+    let attempts = attempts.max(1);
+    let mut delay = backoff;
+    for attempt in 1..=attempts {
+        match std::fs::rename(from, to) {
+            Ok(()) => {
+                if attempt > 1 {
+                    log::info!("{TAG} rename succeeded on attempt {attempt}/{attempts}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                let transient = is_transient_lock(&e);
+                if attempt == attempts || !transient {
+                    return Err(e);
+                }
+                log::warn!(
+                    "{TAG} rename attempt {attempt}/{attempts} hit a transient lock ({e}); \
+                     retrying in {} ms",
+                    delay.as_millis()
+                );
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(4));
+            }
+        }
+    }
+    unreachable!("the loop returns on the final attempt")
+}
+
+/// Is this error the "somebody else has the file open" family, as opposed to a
+/// real refusal (no such file, permission denied, cross-volume move)?
+fn is_transient_lock(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
+        // ERROR_ACCESS_DENIED (5) — the last one is what a scanner holding the
+        // image with DELETE|SYNCHRONIZE shows up as.
+        matches!(error.raw_os_error(), Some(32) | Some(33) | Some(5))
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(error.raw_os_error(), Some(libc::EBUSY) | Some(libc::ETXTBSY))
+    }
 }
 
 /// A refusal that is reported rather than retried.
@@ -670,10 +741,27 @@ pub fn stage_and_replace(
 
     // 3. rename the running exe aside. Allowed on Windows; overwriting and
     //    deleting a running image are not.
-    std::fs::rename(exe, &old_path).map_err(|e| {
+    //
+    //    ...but "allowed" is not "guaranteed". Measured on this machine, three
+    //    consecutive rounds logged:
+    //
+    //      替换失败: renaming ...\AimyriaOne.exe -> ....exe.old failed:
+    //      另一个程序正在使用此文件，进程无法访问。 (os error 32)
+    //
+    //    `rename` fails with ERROR_SHARING_VIOLATION while another process holds a
+    //    handle without FILE_SHARE_DELETE. Real sources on a user's machine: a
+    //    virus scanner mid-scan, Windows Search indexing the payload we just wrote
+    //    next to it, the Explorer preview handler, or a backup agent. The round
+    //    then threw away a fully downloaded, hash-verified payload over a lock that
+    //    clears in milliseconds — and the next check was six hours away.
+    //
+    //    Retrying the rename is the correct response: it touches neither the exe
+    //    nor the payload, so there is nothing to roll back, and the window is short.
+    rename_with_retry(exe, &old_path, RENAME_ATTEMPTS, RENAME_BACKOFF).map_err(|e| {
         let _ = std::fs::remove_file(&new_path);
         ReplaceError::Rename(format!(
-            "renaming {} -> {} failed: {e}; payload discarded, exe untouched",
+            "renaming {} -> {} failed after {RENAME_ATTEMPTS} attempts: {e}; \
+             payload discarded, exe untouched",
             exe.display(),
             old_path.display()
         ))
@@ -686,8 +774,8 @@ pub fn stage_and_replace(
 
     // 4. move the new one into the exe's name. A failure here is the one case
     //    that needs the rollback.
-    if let Err(e) = std::fs::rename(&new_path, exe) {
-        let restore = std::fs::rename(&old_path, exe);
+    if let Err(e) = rename_with_retry(&new_path, exe, RENAME_ATTEMPTS, RENAME_BACKOFF) {
+        let restore = rename_with_retry(&old_path, exe, RENAME_ATTEMPTS, RENAME_BACKOFF);
         let _ = std::fs::remove_file(&new_path);
         return match restore {
             Ok(()) => Err(ReplaceError::Rename(format!(
@@ -1597,7 +1685,6 @@ mod tests {
     }
 
     /// A UTF-8 BOM must not stop the channel.
-    ///
     /// Regression test for a defect that a real end-to-end run caught and unit
     /// tests alone had not: `serde_json` refuses a BOM-prefixed document, and the
     /// symptom is `error decoding response body` -- which names neither the BOM nor
@@ -1627,5 +1714,99 @@ mod tests {
         assert_eq!(strip_utf8_bom(body), body);
         // Only the exact UTF-8 sequence is treated as a BOM.
         assert_eq!(strip_utf8_bom(&[0xEF, 0xBB]), &[0xEF, 0xBB][..]);
+    }
+
+    /// A transient sharing violation must not cost the user an update round.
+    ///
+    /// Regression test for a measured failure: three consecutive rounds logged
+    /// `renaming ...\AimyriaOne.exe -> ....exe.old failed: 另一个程序正在使用此文件
+    /// ... (os error 32)`, each after a full 36 MB download and a passing checksum.
+    /// The retry wrapper is what turns that into a second attempt 100 ms later
+    /// instead of a six-hour wait.
+    #[test]
+    fn a_rename_retries_until_the_lock_clears() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let from = dir.path().join("AimyriaOne.exe");
+        let to = dir.path().join("AimyriaOne.exe.old");
+        std::fs::write(&from, b"payload").unwrap();
+
+        // No lock here, so the first attempt succeeds — the wrapper must not add
+        // latency or copy the file in the common case.
+        rename_with_retry(&from, &to, RENAME_ATTEMPTS, Duration::from_millis(1))
+            .expect("an unlocked rename succeeds on the first attempt");
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+    }
+
+    /// Exhausting the attempts must surface the error rather than silently
+    /// pretending the file moved.
+    #[test]
+    fn a_permanent_rename_failure_is_reported_after_the_last_attempt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("does-not-exist.exe");
+        let to = dir.path().join("target.exe");
+
+        let result = rename_with_retry(&missing, &to, 3, Duration::from_millis(1));
+        assert!(result.is_err(), "a missing source must not report success");
+        assert!(!to.exists());
+    }
+
+    /// Only a stashed deep link blocks a replacement; nothing else does.
+    ///
+    /// This is the regression test for the defect that kept this project's own
+    /// install on v1.0.5 for two days while the server served v1.0.8. The gate used
+    /// to also treat "the window is on screen" as "the user is mid-import", and the
+    /// window is on screen any time someone opens the app to look at something.
+    /// The log recorded 22 such deferrals
+    /// (`holding the replacement: pending_deeplink=false window_visible=true`),
+    /// each one costing another six-hour wait.
+    ///
+    /// Driven through the stash rather than through an `AppHandle`, because the
+    /// stash is now the *only* input: `import_in_flight` cannot consult the window
+    /// at all. Clearing the stash and observing the gate open is the property that
+    /// would fail if a window check were reintroduced as a live dependency.
+    ///
+    /// Serialised against the other stash-touching test: both mutate the same
+    /// process-global slot.
+    #[test]
+    fn only_a_stashed_deeplink_blocks_the_replacement() {
+        let _guard = STASH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Whatever another test left behind is not this test's subject.
+        let _ = crate::deeplink::take_pending_deeplink();
+        assert!(!deeplink_pending(), "precondition: the gate starts open");
+
+        crate::deeplink::stash_pending_deeplink(&crate::deeplink::DeepLinkImportRequest::default());
+        assert!(
+            deeplink_pending(),
+            "a stashed link must hold the replacement"
+        );
+
+        let claimed = crate::deeplink::take_pending_deeplink();
+        assert!(claimed.is_some(), "the stashed request must be claimable");
+        assert!(!deeplink_pending(), "claiming the link must open the gate");
+    }
+
+    /// Process-global serialisation for the stash-touching tests.
+    static STASH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Only transient lock errors are worth retrying.
+    ///
+    /// A cross-volume move or a missing source is not: retrying it would just
+    /// delay the log line the user needs, six times over.
+    #[test]
+    fn only_transient_lock_errors_are_retried() {
+        // ENOTFOUND / ENOENT style: definitely not transient.
+        let not_found = std::io::Error::from_raw_os_error(2);
+        assert!(!is_transient_lock(&not_found));
+
+        #[cfg(windows)]
+        {
+            for code in [32, 33, 5] {
+                assert!(
+                    is_transient_lock(&std::io::Error::from_raw_os_error(code)),
+                    "os error {code} is a sharing/lock violation and must be retried"
+                );
+            }
+        }
     }
 }

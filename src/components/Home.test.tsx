@@ -28,6 +28,9 @@ function client(over: Partial<ClientStatus> = {}): ClientStatus {
     livePath: "C:/Users/a/.claude/settings.json",
     configured: false,
     currentProvider: "aimyria",
+    liveProviderName: "AIMYRIA",
+    stateConsistent: true,
+    inconsistency: null,
     ...over,
   };
 }

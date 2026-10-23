@@ -48,6 +48,18 @@ export interface ClientStatus {
   configured: boolean;
   /** The provider row currently selected, if any. */
   currentProvider: string | null;
+  /** Display name of the row actually written into the client, if it is ours. */
+  liveProviderName: string | null;
+  /**
+   * The selected row agrees with the file on disk.
+   *
+   * `false` means one of the two writes was lost — the provider list says one
+   * thing and the client's config says another. The UI must say so rather than
+   * pick a side, because either answer can be the stale one.
+   */
+  stateConsistent: boolean;
+  /** Human-readable explanation when `stateConsistent` is false. */
+  inconsistency: string | null;
 }
 
 /**

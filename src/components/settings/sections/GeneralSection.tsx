@@ -215,6 +215,20 @@ export function GeneralSection({
               void onAutoSave({ minimizeToTrayOnClose: value })
             }
           />
+          {/* The tray icon switch has been in the data model since the first
+              release but had no control here and nothing read it, so turning it
+              off changed nothing. Wiring it up is what makes the setting honest —
+              and the backend keeps the taskbar button as the fallback entry point
+              when the icon is hidden. */}
+          <SettingsSwitchRow
+            label={t("settings.showInTray")}
+            help={{
+              title: t("settings.showInTray"),
+              body: t("settings.showInTrayHelp"),
+            }}
+            checked={settings.showInTray}
+            onCheckedChange={(value) => void onAutoSave({ showInTray: value })}
+          />
           {isLinux() && (
             <SettingsSwitchRow
               label={t("settings.useAppWindowControls")}

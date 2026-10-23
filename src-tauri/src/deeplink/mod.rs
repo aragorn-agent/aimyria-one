@@ -171,6 +171,18 @@ pub struct DeepLinkImportRequest {
     /// lives on the main site rather than the model gateway.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_url: Option<String>,
+    /// Explicit Claude Desktop routing mode: `"direct"` or `"proxy"`.
+    ///
+    /// Left `None` the mode is inferred from the model list — a group serving real
+    /// `claude-*` ids is imported direct, anything else as a proxy (local router),
+    /// because Desktop's validator rejects foreign model names outright.
+    ///
+    /// That inference suits a console link, which knows nothing about intent. It
+    /// does **not** suit the in-app 「接入」 button: a user who picks proxy mode has
+    /// said what they want, and re-deciding from a model name would silently
+    /// override them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_desktop_mode: Option<String>,
     /// Original aimyria:// URL, attached when the OS delivered the link.
     ///
     /// Not parsed from the query string; it is the whole request. The UI shows

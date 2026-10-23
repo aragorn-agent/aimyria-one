@@ -817,6 +817,8 @@
     "silentStartupDescription": "程序启动时不显示主窗口，仅在系统托盘运行",
     "autoLaunchFailed": "设置开机自启失败",
     "minimizeToTray": "关闭时最小化到托盘",
+    "showInTray": "显示托盘图标",
+    "showInTrayHelp": "关闭后不在系统托盘显示图标。窗口的任务栏按钮会保留，否则关闭窗口后就没有入口了。",
     "minimizeToTrayDescription": "勾选后点击关闭按钮会隐藏到系统托盘，取消则直接退出应用。",
     "useAppWindowControls": "启用应用级窗口按钮",
     "useAppWindowControlsDescription": "开启后使用应用自建的最小化、最大化/还原、关闭按钮；关闭后沿用系统窗口模式。",

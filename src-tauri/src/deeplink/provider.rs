@@ -277,9 +277,22 @@ pub(crate) fn build_provider_from_request(
         // provider, where Desktop sees synthesised `claude-*` route ids and the
         // local router maps them to the real upstream models.
         meta.claude_desktop_mode = Some(desktop_mode_for_request(request));
-        if meta.claude_desktop_mode == Some(ClaudeDesktopMode::Proxy) {
-            meta.claude_desktop_model_routes = desktop_proxy_routes(request);
-        }
+        // Both modes need a route map, for different reasons.
+        //
+        // * Proxy: the route ids are what Desktop sees and the local router
+        //   translates to real upstream names.
+        // * Direct: the routes are *identity mappings* over the `claude-*` ids the
+        //   group actually serves. Without them `inferenceModels` is absent from
+        //   the profile, and Desktop opens with an empty model menu — the write
+        //   looks successful and the app cannot be used.
+        //
+        // This was missing for direct mode from the start; the one-click screen
+        // could therefore produce a "configured" Claude Desktop with no models.
+        meta.claude_desktop_model_routes = if meta.claude_desktop_mode == Some(ClaudeDesktopMode::Proxy) {
+            desktop_proxy_routes(request)
+        } else {
+            desktop_direct_routes(request)
+        };
     }
 
     let endpoint_text = request.endpoint.clone().unwrap_or_default();
@@ -658,6 +671,21 @@ fn version_key(model: &str) -> (u64, u64, u64) {
 /// not "is this a Claude group" — a mixed group still gets direct mode, because
 /// its Claude ids are what Desktop will use.
 fn desktop_mode_for_request(request: &DeepLinkImportRequest) -> ClaudeDesktopMode {
+    // An explicit choice wins. The in-app 「接入」 button sets this; a console link
+    // does not, and falls through to the inference below.
+    match request
+        .claude_desktop_mode
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("proxy") => return ClaudeDesktopMode::Proxy,
+        Some("direct") => return ClaudeDesktopMode::Direct,
+        // Anything else is not a mode we know; fall through rather than guess.
+        _ => {}
+    }
+
     let models: Vec<&String> = request
         .models
         .iter()
@@ -687,6 +715,54 @@ fn desktop_mode_for_request(request: &DeepLinkImportRequest) -> ClaudeDesktopMod
 /// The alias names deliberately carry a version suffix: a bare `claude-sonnet`
 /// is rejected, and reusing Desktop's own current route ids
 /// (`claude-sonnet-5`) would collide with the built-in catalog.
+/// Identity route map for direct mode.
+///
+/// In direct mode Desktop talks to the gateway itself, so the "route id" it shows
+/// must be a real model id from the group. This builds a one-to-one map of those
+/// ids — no renaming, no role synthesis — which is what `inferenceModels` is built
+/// from.
+///
+/// Only `claude-*` names are accepted, because Desktop's validator rejects the
+/// whole list on a single foreign name: one `deepseek-*` entry would empty the menu
+/// for every model.
+fn desktop_direct_routes(
+    request: &DeepLinkImportRequest,
+) -> std::collections::HashMap<String, crate::provider::ClaudeDesktopModelRoute> {
+    use crate::provider::ClaudeDesktopModelRoute;
+
+    let mut ordered: Vec<String> = request.models.clone().unwrap_or_default();
+    if let Some(primary) = request
+        .model
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
+        ordered.retain(|id| id != &primary);
+        ordered.insert(0, primary);
+    }
+
+    let mut routes = std::collections::HashMap::new();
+    for id in ordered {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower.starts_with("claude-") || lower.starts_with("anthropic/claude-")) {
+            // Skip rather than fail: one foreign name must not empty the menu.
+            continue;
+        }
+        routes.insert(
+            trimmed.to_string(),
+            ClaudeDesktopModelRoute {
+                model: trimmed.to_string(),
+                label_override: None,
+                supports_1m: None,
+            },
+        );
+    }
+    routes
+}
+
 fn desktop_proxy_routes(
     request: &DeepLinkImportRequest,
 ) -> std::collections::HashMap<String, crate::provider::ClaudeDesktopModelRoute> {

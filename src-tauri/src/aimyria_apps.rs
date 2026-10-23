@@ -318,6 +318,122 @@ fn workbuddy_entry_is_ours(entry: &Value, endpoint: &str) -> bool {
     entry.get("id").and_then(Value::as_str) == Some(PROVIDER_KEY) && url.is_none()
 }
 
+/// Put WorkBuddy back on its own built-in models.
+///
+/// # What "official" means for this client
+///
+/// WorkBuddy ships a built-in model catalogue. Everything this tool ever added
+/// lives in `models.json` as a record with `vendor: "Custom"` and one of our
+/// endpoints. So reverting is: **remove our records, keep every other record,
+/// and drop our ids from `availableModels`**.
+///
+/// # What it must not do
+///
+/// * It must not delete a record just because it says `vendor: "Custom"`. A user
+///   who added their own OpenAI-compatible endpoint by hand has one too, and
+///   deleting it would destroy their setup. The test is the endpoint, not the
+///   vendor.
+/// * It must not delete the whole file. `models.json` is the app's file.
+/// * It must not fail when there is nothing to remove — "already official" is a
+///   success, not an error, or the button looks broken the second time it is
+///   pressed.
+///
+/// # Why it returns what it removed
+///
+/// So the UI can say "removed 6 entries" instead of silently changing a file the
+/// user may be looking at in WorkBuddy's own panel.
+pub fn revert_workbuddy_to_official_at(path: &Path) -> Result<usize, AppError> {
+    if !path.exists() {
+        // Nothing was ever written on this machine.
+        return Ok(0);
+    }
+
+    let existing = read_json_file::<Value>(path)
+        .map_err(|e| AppError::InvalidInput(format!("读取 WorkBuddy 配置失败: {e}")))?;
+    let as_array = matches!(existing, Value::Array(_));
+
+    let mut entries: Vec<Value> = match existing {
+        Value::Array(items) => items,
+        Value::Object(mut map) => map
+            .remove("models")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    let before = entries.len();
+    let mut removed_ids: Vec<String> = Vec::new();
+    entries.retain(|entry| {
+        let ours = workbuddy_entry_points_at_our_relay(entry);
+        if ours {
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                removed_ids.push(id.to_string());
+            }
+        }
+        !ours
+    });
+    let removed = before - entries.len();
+
+    if removed == 0 {
+        // Already official. Do not rewrite the file just to prove it.
+        return Ok(0);
+    }
+
+    let merged = if as_array {
+        Value::Array(entries)
+    } else {
+        // Drop our ids from the panel's enabled list as well; leaving them there
+        // makes WorkBuddy show a model that no longer has a record behind it.
+        let available: Vec<String> = existing_available_models(path)
+            .into_iter()
+            .filter(|id| !removed_ids.iter().any(|removed| removed == id))
+            .collect();
+        json!({ "models": entries, "availableModels": available })
+    };
+
+    let text = serde_json::to_string_pretty(&merged)
+        .map_err(|e| AppError::InvalidInput(format!("WorkBuddy 配置序列化失败: {e}")))?;
+    atomic_write(path, format!("{text}\n").as_bytes())?;
+
+    log::info!(
+        "[workbuddy] reverted to official models, removed {removed} entr{}",
+        if removed == 1 { "y" } else { "ies" }
+    );
+    Ok(removed)
+}
+
+fn existing_is_array(path: &Path) -> bool {
+    matches!(read_json_file::<Value>(path), Ok(Value::Array(_)))
+}
+
+/// Was this record written against one of our relays?
+///
+/// Endpoint-based, deliberately: `vendor: "Custom"` is shared with the user's own
+/// third-party models, and an `id`-based test cannot see records the console wrote
+/// under a different id.
+fn workbuddy_entry_points_at_our_relay(entry: &Value) -> bool {
+    let url = entry
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if url.is_some_and(points_at_our_relay) {
+        return true;
+    }
+    // The field the first writer emitted; it is not a WorkBuddy field.
+    entry
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .is_some_and(points_at_our_relay)
+}
+
+/// Build a WorkBuddy record for a relay model id.
+///
+/// The per-model limits come from what the relay actually serves where known:
+/// a 1M-context group gets `maxInputTokens: 1_000_000`, and an unknown model
+/// keeps conservative defaults rather than claiming a window it does not have.
+/// Claiming too much is the failure that shows up as a truncated conversation
+/// after the user has already sent the prompt.
 fn existing_available_models(path: &Path) -> Vec<String> {
     read_json_file::<Value>(path)
         .ok()
@@ -358,13 +474,15 @@ fn is_utility_model(id: &str) -> bool {
 }
 
 /// Whether a host belongs to one of our relays.
+/// Does this URL point at one of our relays?
+///
+/// Delegated to [`crate::relay::hosts`], which owns the host list. The local copy
+/// this replaced knew `api.aimyria.com`, `321ai.cc` and a substring match on
+/// `aimyria.com` — and therefore **missed `sub2.aimyria.com`**, which is exactly
+/// what a newer console import writes. That is the same class of drift that once
+/// made the one-click screen report a configured client as unconfigured.
 fn points_at_our_relay(url: &str) -> bool {
-    const HOSTS: [&str; 3] = [
-        crate::commands::aimyria::RELAY_HOST,
-        crate::commands::aimyria::RELAY_ALT_HOST,
-        "321ai.cc",
-    ];
-    HOSTS.iter().any(|host| url.contains(host))
+    crate::relay::is_relay_endpoint(url).is_some()
 }
 
 /// Write dsh's `cordis.patch.yml` and credentials.
@@ -870,6 +988,80 @@ fn urlencoding(value: &str) -> String {
 /// flat list. `write_workbuddy_at` turns it into one record per model, because
 /// that is what WorkBuddy's `models.json` holds — see that function for why a
 /// single record cannot carry a list.
+/// The endpoint and key a file-based client is currently using.
+///
+/// # Why the two clients need their own reader
+///
+/// WorkBuddy and DeepSeek Harness have no provider row — their key lives in their
+/// own config file — so `Provider::resolve_usage_credentials` cannot answer for
+/// them. The keys screen needs the same answer for every client, which means this
+/// one function has to speak both file formats.
+///
+/// Returns `(endpoint, secret)`. Either half may be empty when the file exists but
+/// does not carry that field; the caller decides whether that counts as bound.
+pub fn read_live_credentials(app: AimyriaOnlyApp) -> Option<(String, String)> {
+    match app {
+        AimyriaOnlyApp::WorkBuddy => {
+            let text = std::fs::read_to_string(app.live_path()).ok()?;
+            let json: Value = serde_json::from_str(&text).ok()?;
+            // The file is either a bare array or an object with `models`.
+            let entries = json
+                .as_array()
+                .cloned()
+                .or_else(|| json.get("models").and_then(|v| v.as_array()).cloned())?;
+            for entry in entries {
+                let url = entry.get("url").and_then(Value::as_str).unwrap_or("");
+                let key = entry.get("apiKey").and_then(Value::as_str).unwrap_or("");
+                if !key.trim().is_empty() {
+                    return Some((url.trim().to_string(), key.trim().to_string()));
+                }
+            }
+            None
+        }
+        AimyriaOnlyApp::DeepSeekHarness => {
+            // Endpoint lives in the profile patch, the key in the credentials file
+            // beside it. Both are needed for a useful answer, but a missing endpoint
+            // still tells us which key is bound, so fall back to an empty endpoint.
+            let patch = std::fs::read_to_string(app.live_path()).unwrap_or_default();
+            let endpoint = patch
+                .lines()
+                .find_map(|line| {
+                    let trimmed = line.trim();
+                    trimmed.strip_prefix("baseURL:").map(|rest| {
+                        rest.trim().trim_matches('"').trim().to_string()
+                    })
+                })
+                .unwrap_or_default();
+            let key = dsh_credential_secret()?;
+            Some((endpoint, key))
+        }
+    }
+}
+
+/// The `AIMYRIA_API_KEY` value from whichever dsh profile holds it.
+fn dsh_credential_secret() -> Option<String> {
+    // The import writes the key next to the profile it configured, and this machine
+    // has more than one profile (`desktop`, `web`), so scan rather than guess.
+    for name in dsh_profiles() {
+        let path = dsh_home()
+            .join("profiles")
+            .join(&name)
+            .join(".credentials.yaml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("AIMYRIA_API_KEY:") {
+                let value = rest.trim().trim_matches('"').trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn build_workbuddy_settings(endpoint: &str, api_key: &str, models: &[String]) -> Value {
     json!({
         "provider": PROVIDER_KEY,
@@ -1293,5 +1485,121 @@ mod tests {
             Some(AimyriaOnlyApp::DeepSeekHarness)
         );
         assert_eq!(AimyriaOnlyApp::from_str("hermes"), None);
+    }
+
+    // ── revert to official ─────────────────────────────────────────────────
+
+    /// Reverting withdraws our records and keeps everything else.
+    ///
+    /// The data-loss risk here is real: this machine's own `models.json` had six
+    /// hand-written records, five of them on `wb.321ai.cc` — one of our domains.
+    /// Any rule that matches "vendor Custom" or "our host" rather than the specific
+    /// endpoint would delete the user's models along with ours.
+    #[test]
+    fn reverting_removes_only_records_aimed_at_our_relays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+
+        let file = json!([
+            { "id": "ours-1", "vendor": "Custom", "url": "https://api.aimyria.com/v1" },
+            { "id": "ours-2", "vendor": "Custom", "url": "https://sub2.aimyria.com/v1" },
+            { "id": "theirs", "vendor": "Custom", "url": "https://my-own-endpoint.example/v1" },
+            { "id": "builtin", "vendor": "DeepSeek", "url": "https://api.deepseek.com/v1" }
+        ]);
+        std::fs::write(&path, file.to_string()).unwrap();
+
+        let removed = revert_workbuddy_to_official_at(&path).expect("revert");
+        assert_eq!(removed, 2, "only our two records are withdrawn");
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ids: Vec<&str> = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["theirs", "builtin"]);
+    }
+
+    /// Reverting when nothing of ours is present succeeds with a count of zero.
+    ///
+    /// A button that errors the second time it is pressed looks broken, and the
+    /// second press is exactly what a user does when they are unsure it worked.
+    #[test]
+    fn reverting_an_already_official_file_is_a_no_op_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            json!([{ "id": "builtin", "vendor": "DeepSeek", "url": "https://api.deepseek.com/v1" }])
+                .to_string(),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let removed = revert_workbuddy_to_official_at(&path).expect("must not error");
+        assert_eq!(removed, 0);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a no-op must not rewrite the file"
+        );
+    }
+
+    /// A missing file is "never configured", not an error.
+    #[test]
+    fn reverting_a_missing_file_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        assert_eq!(revert_workbuddy_to_official_at(&path).unwrap(), 0);
+        assert!(!path.exists(), "no file should be created");
+    }
+
+    /// The object shape keeps `availableModels` in sync, or WorkBuddy keeps listing
+    /// a model that no longer has a record behind it.
+    #[test]
+    fn reverting_the_object_shape_also_prunes_the_enabled_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            json!({
+                "models": [
+                    { "id": "ours", "vendor": "Custom", "url": "https://api.aimyria.com/v1" },
+                    { "id": "theirs", "vendor": "Custom", "url": "https://mine.example/v1" }
+                ],
+                "availableModels": ["ours", "theirs"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(revert_workbuddy_to_official_at(&path).unwrap(), 1);
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let available: Vec<&str> = after["availableModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(available, vec!["theirs"], "our id must leave the enabled list");
+    }
+
+    /// `sub2.aimyria.com` counts as ours.
+    ///
+    /// The predicate this replaced listed `api.aimyria.com`, `321ai.cc`, and a
+    /// substring test for `aimyria.com` — which happens to miss nothing on its own,
+    /// but the point is the list is now the shared one, so a host added to
+    /// `relay/hosts.rs` is recognised here automatically.
+    #[test]
+    fn the_sub_gateway_is_recognised_as_ours() {
+        assert!(points_at_our_relay("https://sub2.aimyria.com/v1"));
+        assert!(points_at_our_relay("https://api.aimyria.com/v1"));
+        assert!(points_at_our_relay("https://aimyria.com/v1"));
+        assert!(!points_at_our_relay("https://notaimyria.com/v1"));
+        assert!(!points_at_our_relay("https://aimyria.com.evil.example"));
     }
 }

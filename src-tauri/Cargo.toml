@@ -15,7 +15,7 @@ name = "aimyria-one"
 # number and reports "already up to date" forever -- the exact failure this
 # version bump exists to escape. `scripts/check_version_sync.ps1` checks all
 # three.
-version = "1.0.8"
+version = "1.4.0"
 description = "AIMYRIA GO - one-click configuration tool for AI coding CLIs"
 # Upstream author must be retained per MIT license.
 # Original: https://github.com/farion1231/cc-switch  (Copyright (c) 2025 Jason Young)
@@ -152,6 +152,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    # DPAPI: the long-lived console session is stored encrypted under the current
+    # Windows user (see `relay/session.rs`). Without this feature the crate has no
+    # CryptProtectData symbol and the session layer cannot be built.
+    "Win32_Security_Cryptography",
 ] }
 
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]

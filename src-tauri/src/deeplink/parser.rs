@@ -185,6 +185,10 @@ fn parse_provider_deeplink(
         opus_model,
         models,
         group_name,
+        // A console link never states a Desktop mode; the import infers it from the
+        // model list, which is the right call for a link. Only the in-app 接入
+        // button sets this explicitly.
+        claude_desktop_mode: None,
         balance_token,
         balance_url,
         raw_url: None,
@@ -264,6 +268,7 @@ fn parse_prompt_deeplink(
         models: None,
         group_name: None,
         balance_token: None,
+        claude_desktop_mode: None,
         balance_url: None,
         raw_url: None,
         apps: None,
@@ -343,6 +348,7 @@ fn parse_mcp_deeplink(
         models: None,
         group_name: None,
         balance_token: None,
+        claude_desktop_mode: None,
         balance_url: None,
         raw_url: None,
         content: None,
@@ -404,6 +410,7 @@ fn parse_skill_deeplink(
         models: None,
         group_name: None,
         balance_token: None,
+        claude_desktop_mode: None,
         balance_url: None,
         raw_url: None,
         content: None,

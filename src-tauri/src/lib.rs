@@ -33,6 +33,7 @@ mod lightweight;
 mod linux_fix;
 mod live;
 mod live_writer;
+pub mod logging;
 pub mod mcode_config;
 mod mcp;
 mod mode;
@@ -43,6 +44,7 @@ mod panic_hook;
 mod pi_config;
 mod prompt;
 mod prompt_files;
+pub mod relay;
 mod provider;
 mod proxy;
 mod services;
@@ -50,9 +52,9 @@ mod session_manager;
 mod settings;
 mod store;
 mod usage_script;
-
 mod tray;
 mod updater;
+mod window_policy;
 mod usage_events;
 
 pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
@@ -258,6 +260,23 @@ fn runtime_log_level_allows(level: log::Level, max_level: log::LevelFilter) -> b
     max_level.to_level().is_some_and(|maximum| level <= maximum)
 }
 
+/// Did this launch come from the start-on-login entry?
+///
+/// `auto_launch` writes `"<exe>" --autostart`, so the flag is present for every
+/// login start and absent when a person double-clicks the icon. The single-instance
+/// callback uses it to tell "the machine started us" (leave the UI alone — a user
+/// who just signed in did not ask to see a window) from "the user clicked us"
+/// (raise the window, that is the whole point of clicking).
+///
+/// Matching is case-insensitive and tolerant of the flag appearing anywhere, so a
+/// hand-edited `Run` value still classifies correctly.
+fn argv_is_autostart(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.trim().trim_matches('"');
+        arg.eq_ignore_ascii_case("--autostart") || arg.eq_ignore_ascii_case("/autostart")
+    })
+}
+
 /// 统一处理 aimyria:// 深链接 URL
 ///
 /// - 解析 URL
@@ -446,14 +465,37 @@ pub fn run() {
             // old code's `set_skip_taskbar(false)`/`unminimize`/`show`/`set_focus`
             // sequence is not simply moved inside the `if`.
             //
-            // An explicit "user wants the UI back" affordance already exists and does
-            // not need this path: the tray icon's left click calls
-            // `tray::show_main_window`. Anything that wants the window should say so
-            // through that, or through a deep link -- not by re-launching the binary.
+            // # Why a link-less launch is no longer ignored outright
+            //
+            // The fix above overcorrected. "No deep link" was treated as "nobody is
+            // asking for the UI", which is true for a script but false for the one
+            // case that matters most: a user double-clicking the app's own icon.
+            // Windows runs the icon again, the mutex routes it here with no
+            // arguments, and the old code logged "leaving the window exactly as the
+            // user left it" and did nothing. To the user the program looked dead —
+            // they clicked it and nothing appeared, which is the report "它没再启动过 /
+            // 没有任何反应".
+            //
+            // The distinction that matters is who launched us, and it is available
+            // without guessing: the autostart entry always passes `--autostart`
+            // (see `auto_launch`), while an Explorer double-click carries nothing.
+            // So a bare launch is a user request, and showing/focusing is idempotent
+            // when the window is already visible. The updater's own restart passes
+            // the original args through, so it never takes this branch either.
             if found_deeplink {
                 log::info!("Single-instance wake carried a deep link; the window is raised by the deep-link handler");
+            } else if argv_is_autostart(&args) {
+                log::info!(
+                    "Single-instance wake is an autostart entry; leaving the window as the user left it"
+                );
             } else {
-                log::info!("Single-instance wake carried no deep link; leaving the window exactly as the user left it");
+                // A person launched the app again. Raise the window: for a tray app
+                // this is the only feedback that "I clicked the icon and nothing
+                // happened" is no longer true.
+                log::info!(
+                    "Single-instance wake carried no deep link; raising the window for the user"
+                );
+                crate::tray::show_main_window(app);
             }
         }));
     }
@@ -468,8 +510,14 @@ pub fn run() {
                 && !startup_page_handled.swap(true, Ordering::Relaxed)
                 && !crate::settings::get_settings().silent_startup
             {
-                let _ = webview.window().show();
-                log::info!("主页面加载完成，主窗口已显示");
+                let window = webview.window();
+                let _ = window.show();
+                // A window that is now on screen must own a taskbar button. This
+                // path shows the window without going through
+                // `tray::show_main_window`, so it has to make the same claim.
+                #[cfg(target_os = "windows")]
+                let _ = window.set_skip_taskbar(false);
+                log::info!("主页面加载完成，主窗口已显示（含任务栏按钮）");
             }
         });
     }
@@ -485,33 +533,52 @@ pub fn run() {
                 let in_db_recovery = crate::init_status::get_init_error()
                     .map(|p| p.kind.as_deref() == Some("db_version_too_new"))
                     .unwrap_or(false);
-                if in_db_recovery {
-                    api.prevent_close();
-                    window.app_handle().exit(0);
-                    return;
-                }
 
                 let settings = crate::settings::get_settings();
 
-                if settings.minimize_to_tray_on_close {
+                // Closing the window of a tray app means "put it away", not "quit".
+                //
+                // It used to mean quit whenever `minimizeToTrayOnClose` was false —
+                // which is its value on a machine that has never opened settings.
+                // So the X button ended the process, and the tray icon vanished with
+                // it: the program was simply gone, which is what "它关掉了" reported.
+                //
+                // The setting now defaults to on and is honoured; recovery mode is
+                // the one exception, because it has no working tray to return to.
+                if crate::window_policy::close_should_hide(
+                    settings.minimize_to_tray_on_close,
+                    in_db_recovery,
+                ) {
                     api.prevent_close();
-                    // Order matters: drop the taskbar button **while the window is still
-                    // visible**, then hide it.
+
+                    // Hide first, then adjust the taskbar button.
                     //
-                    // On Windows, Tauri implements `set_skip_taskbar` by switching the
-                    // window to ToolWindow style, and a style change on an already-hidden
-                    // window is not guaranteed to be applied or repainted -- which is
-                    // exactly why the old `set_skip_taskbar(true)` on the hidden silent
-                    // window measured as a no-op (`transitions=0`, `WS_EX_APPWINDOW` still
-                    // set; see the note in the silent_startup branch). Doing it in this
-                    // order means the button is really gone before the window leaves the
-                    // screen, instead of leaving a dead taskbar button behind.
+                    // Measured: calling `set_skip_taskbar(true)` *before* `hide()`
+                    // left the window visible — the COM call (`ITaskbarList::
+                    // DeleteTab`) makes the shell re-evaluate the window, and that
+                    // re-evaluation can land after `hide()` and restore it. The
+                    // log said "最小化到托盘" while the window stayed on screen,
+                    // which is exactly the kind of assertion-without-observation
+                    // that the last two rounds were about.
+                    //
+                    // Hiding first is also the honest order: the window is gone
+                    // from the screen, then the button that represented it is
+                    // withdrawn.
+                    let hidden = window.hide();
+                    if let Err(e) = &hidden {
+                        log::warn!("隐藏窗口失败: {e}");
+                    }
                     #[cfg(target_os = "windows")]
                     {
-                        let _ = window.set_skip_taskbar(true);
+                        // Only bother once the window is actually off the screen.
+                        if hidden.is_ok() {
+                            let _ = window.set_skip_taskbar(true);
+                        }
                     }
-                    let _ = window.hide();
-                    log::info!("关闭请求已处理：最小化到托盘");
+                    log::info!(
+                        "关闭请求已处理：最小化到托盘，进程继续运行（hide={}）",
+                        if hidden.is_ok() { "ok" } else { "failed" }
+                    );
                     #[cfg(target_os = "macos")]
                     {
                         tray::apply_tray_policy(window.app_handle(), false);
@@ -541,9 +608,10 @@ pub fn run() {
 
             // 初始化日志（输出到 <app_config_dir>/logs/aimyria-one.log）
             {
-                use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
+                use tauri_plugin_log::{Target, TargetKind, TimezoneStrategy};
 
                 let log_dir = panic_hook::get_log_dir();
+                let log_file = log_dir.join("aimyria-one.log");
 
                 // 确保日志目录存在
                 if let Err(e) = std::fs::create_dir_all(&log_dir) {
@@ -560,17 +628,36 @@ pub fn run() {
                         .filter(|metadata| {
                             runtime_log_level_allows(metadata.level(), log::max_level())
                         })
-                        .targets([
-                            Target::new(TargetKind::Stdout),
-                            Target::new(TargetKind::Folder {
-                                path: log_dir,
-                                file_name: Some("aimyria-one".into()),
-                            }),
-                        ])
-                        // KeepSome(4) 保留 4 个轮转归档，加上当前文件最多约 100 MiB。
-                        // 轮转仅按大小触发；跨重启继续追加，不再丢失上一次运行的日志。
-                        .rotation_strategy(RotationStrategy::KeepSome(4))
-                        .max_file_size(20 * 1024 * 1024)
+                        // 只有文件一个 sink，且这个 sink **永远不会失败**。
+                        //
+                        // 走 `TargetKind::Folder` 是不行的，哪怕是唯一的 target：
+                        // fern 的 `fallback_on_error` 在写文件失败时会去写 stderr，
+                        // stderr 也失败就 `panic!`（fern-0.7.1/src/log_impl.rs:896）。
+                        // release 版 `windows_subsystem = "windows"` 没有控制台，
+                        // 第二步必然失败，于是 panic 落在写日志的那一行 —— 而启动流程
+                        // 里到处都是 `log::info!`，结果是进程在托盘图标出现前就消失。
+                        //
+                        // 本机 crash.log 里两条崩溃报告就是这个形状：
+                        //   Message: Error performing stderr logging after error occurred
+                        //   during regular logging ... stderr error: 管道正在被关闭。
+                        //   (os error 232)
+                        // 触发时正在写 `已插入 222 条默认模型定价数据` 和
+                        // `✓ Copilot / Codex OAuth / xAI OAuth managers initialized`，
+                        // 都是普通的启动 INFO。用户看到的就是"自己闪退、再也起不来"。
+                        //
+                        // `logging::PanicProofWriter` 的 `Write` 永远返回 Ok：丢掉一行
+                        // 日志是诊断缺口，被自己的日志系统杀死是服务中断，后者必须
+                        // 不能发生。轮转也由它负责，所以不再需要 `RotationStrategy`。
+                        .targets([Target::new(TargetKind::Dispatch(
+                            tauri_plugin_log::fern::Dispatch::new().chain(
+                                tauri_plugin_log::fern::Output::writer(
+                                    Box::new(logging::PanicProofWriter::new(log_file)),
+                                    "\n",
+                                ),
+                            ),
+                        ))])
+                        // 轮转与大小上限都由 `PanicProofWriter` 自己实现（它必须在
+                        // 写失败时仍然返回 Ok，所以不能用插件的 RotatingFile）。
                         .timezone_strategy(TimezoneStrategy::UseLocal)
                         .build(),
                 )?;
@@ -578,6 +665,13 @@ pub fn run() {
                 // 用户配置存在数据库中，数据库尚未打开时使用保守的 Info 级别。
                 log::set_max_level(log::LevelFilter::Info);
                 log::info!("=== AIMYRIA GO v{} started ===", env!("CARGO_PKG_VERSION"));
+
+                // 上一段进程可能因为写日志失败而丢过行；现在日志系统已就绪，
+                // 在文件里留一条记录，免得"日志有断层"被误读成"程序没运行"。
+                let dropped = logging::dropped_writes();
+                if dropped > 0 {
+                    log::warn!("日志写入曾有 {dropped} 行被丢弃（目标不可写），后续行已恢复");
+                }
             }
 
             // 静默自更新：启动 60 秒后首次检查，此后每 6 小时一次。
@@ -753,6 +847,27 @@ pub fn run() {
             // than at the end of setup means a later import that panics cannot
             // leave the process half-built with no state at all.
             app.manage(app_state.clone());
+
+            // Console session.
+            //
+            // Managed separately from `AppState` on purpose: the session is read at
+            // startup (before the database is necessarily open) and is dropped on
+            // sign-out, while `AppState` is built once around the database. Mixing
+            // the two would mean every test that constructs an `AppState` also has
+            // to think about DPAPI.
+            //
+            // `SessionState::load` never fails: a missing or corrupt file means
+            // "signed out", which is a normal state and must not block startup.
+            let relay_session = std::sync::Arc::new(crate::relay::SessionState::load());
+            {
+                let status = tauri::async_runtime::block_on(relay_session.status());
+                if status.signed_in {
+                    log::info!("[relay] 已载入本机登录态: {}", status.account);
+                } else {
+                    log::info!("[relay] 本机尚无登录态");
+                }
+            }
+            app.manage(relay_session);
 
             // 初始化 SkillService
             let skill_service = crate::services::skill::SkillService::new();
@@ -1116,15 +1231,73 @@ pub fn run() {
                 tray_builder = tray_builder.icon(icon).icon_as_template(template);
             }
 
-            let _tray = tray_builder.build(app)?;
+            let tray = tray_builder.build(app)?;
+
+            // Honour "show in tray".
+            //
+            // The setting has existed since the first release with a default of
+            // true, but nothing ever read it: turning it off changed nothing, which
+            // is worse than not offering it. Now it hides the icon — with one
+            // guard: a hidden window plus no tray icon would leave a running
+            // process with no way to reach it, so `window_policy` keeps the
+            // taskbar button in that case, and this only hides the icon when the
+            // window is on screen or the policy says it is safe.
+            {
+                let settings = crate::settings::get_settings();
+                let window_visible = app
+                    .get_webview_window("main")
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false);
+                let policy = crate::window_policy::decide(crate::window_policy::WindowState {
+                    window_visible,
+                    show_in_tray: settings.show_in_tray,
+                    lightweight: crate::lightweight::is_lightweight_mode(),
+                });
+                if !policy.tray_icon {
+                    if let Err(e) = tray.set_visible(false) {
+                        log::warn!("按设置隐藏托盘图标失败: {e}");
+                    } else {
+                        log::info!("设置已关闭托盘图标；窗口的任务栏按钮保留作为入口");
+                    }
+                }
+            }
 
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
 
 
 
             // 初始化全局出站代理 HTTP 客户端
+            //
+            // 这里是该初始化真正发生的地方 —— 之前这段只剩 `let db = &...`，读到
+            // 数据库句柄就结束了，客户端从来没被建出来。后果有两个，都能在日志里
+            // 直接看到：
+            //
+            //   1. 每一条走 `proxy::http_client::get()` 的请求都落到 fallback 分支，
+            //      打一行 `[GP-004] Client not initialized, using fallback`。余额轮询
+            //      （15 分钟一次）、托盘用量刷新、模型列表都会走这条路，日志里那些
+            //      成串的 GP-004 就是它。
+            //   2. 更重要的是，fallback 会 **每次调用都新建一个 reqwest Client**：
+            //      没有连接池复用，没有 keep-alive，每次都要重新做 TLS 握手。一个
+            //      托盘常驻程序最不该在的地方浪费资源和时间。
+            //
+            // 用户配置的代理（`global_proxy_url`）也因此永远不生效：`apply_proxy`
+            // 在客户端不存在时会改走 `init`，而 `init` 只被 S3 测试路径调用过。
+            //
+            // 初始化必须早于任何后台任务，所以放在托盘建好之后、`balance_watch` /
+            // `updater` 这些会发请求的任务启动之前。
             {
-                let db = &app.state::<AppState>().db;
+                let proxy_url = app
+                    .state::<AppState>()
+                    .db
+                    .get_global_proxy_url()
+                    .unwrap_or_else(|e| {
+                        log::warn!("读取全局代理配置失败，按直连处理: {e}");
+                        None
+                    });
+                match crate::proxy::http_client::init(proxy_url.as_deref()) {
+                    Ok(()) => log::info!("✓ 全局 HTTP 客户端已初始化"),
+                    Err(e) => log::warn!("全局 HTTP 客户端初始化失败（将退化为每次新建连接）: {e}"),
+                }
             }
 
             // 异常退出恢复 + 代理状态自动恢复
@@ -1206,38 +1379,41 @@ pub fn run() {
                     let _ = window.set_shadow(true);
                 }
                 if settings.silent_startup {
-                    // 静默启动模式：保持窗口隐藏。
+                    // 静默启动：窗口保持隐藏。
                     //
-                    // # 关于任务栏：`skipTaskbar: true` 不是本 bug 的修复
+                    // # 任务栏：这里曾经写的是 `skipTaskbar: true`，那是个错误
                     //
-                    // `tauri.conf.json` 的 main 窗口现在声明 `"skipTaskbar": true`。
-                    // **它没有修掉任何东西** —— 必须写清楚，否则下一个人会以为它修过。
+                    // 配置里声明过 `"skipTaskbar": true`，于是**任何**情况下主窗口都
+                    // 拿不到任务栏按钮。托盘图标一旦被隐藏（或 Explorer 重启丢了它），
+                    // 这个程序就变成"进程还在跑，但没有任何入口"——用户点任务栏找不到，
+                    // 也没有窗口可以点。这就是"常驻不了任务栏"的根因。
                     //
-                    // 原来的推断是：窗口创建时任务栏先出现一个按钮，随后被这里的
-                    // `set_skip_taskbar(true)` 移除 → "闪一下"，所以改成创建阶段就设对。
-                    // **这个推断已被证伪**：用未修复的旧构建做对照，主窗口 `visible=false`
-                    // 且从未 `show()` 过，因此**从来就没有任务栏按钮**（Windows 只给可见的
-                    // 顶层窗口放按钮），所谓"先出现再消失"在静默路径上不存在。
+                    // 现在配置是 `false`，并且按 `window_policy` 决定：
+                    //   · 窗口可见 → 一定有任务栏按钮；
+                    //   · 窗口隐藏 + 托盘图标在 → 收起按钮（托盘就是入口）；
+                    //   · 窗口隐藏 + 托盘图标被关 → **保留**按钮（否则没有入口）。
                     //
-                    // 那为什么保留？因为它把默认值设**对**了：一个"静默启动、托盘常驻"的
-                    // 窗口本来就不该在创建阶段具备任务栏资格；而且将来任何一次 `show()`
-                    // 都会由那 4 处 `set_skip_taskbar(false)` 正确恢复。零成本、语义更严密。
-                    //
-                    // # 这里原本那句 `set_skip_taskbar(true)` 为什么删了
-                    //
-                    // 它没有任何效果，留着只会让后人以为任务栏已处理。实测（运行中进程，
-                    // 每 60ms 采样主窗口 exStyle，共 6 秒）：`firstExStyle=0x40110`、
-                    // `WS_EX_APPWINDOW` 恒为 True、`transitions=0`。
-                    //
-                    // 至于"为什么它没效果"，`ITaskbarList` 那位同学给出了更准确的答案：
-                    // tao 0.34.6 把 `skip_taskbar` 实现为
-                    // `taskbar_list.DeleteTab(hwnd)` / `AddTab(hwnd)` —— **一个 COM 调用，
-                    // 根本不改扩展样式**。所以"读 `WS_EX_APPWINDOW` 判断有没有任务栏按钮"
-                    // 这套判据从头到尾就是错的，既不能证明有、也不能证明没有。
+                    // 静默启动这一支正好是"窗口隐藏"，所以要不要收按钮，取决于托盘图标
+                    // 是否还在。
+                    let policy = crate::window_policy::decide(crate::window_policy::WindowState {
+                        window_visible: false,
+                        show_in_tray: settings.show_in_tray,
+                        lightweight: false,
+                    });
+                    #[cfg(target_os = "windows")]
+                    {
+                        // show/hide 之后再设最可靠；隐藏前设也有效，但先 hide 再设
+                        // 会让 Explorer 看不到变化。这里在 hide 之前设定，语义是
+                        // "这个窗口不该出现在任务栏"，然后才隐藏。
+                        let _ = window.set_skip_taskbar(!policy.taskbar_button);
+                    }
                     let _ = window.hide();
                     #[cfg(target_os = "macos")]
                     tray::apply_tray_policy(app.handle(), false);
-                    log::info!("静默启动模式：主窗口已隐藏");
+                    log::info!(
+                        "静默启动模式：主窗口已隐藏（任务栏按钮 {}）",
+                        if policy.taskbar_button { "保留" } else { "移除" }
+                    );
                 } else {
                     // 正常启动模式：显示窗口
                     #[cfg(not(target_os = "windows"))]
@@ -1286,7 +1462,31 @@ pub fn run() {
             commands::get_client_status,
             commands::configure_all,
             commands::configure_one,
+            commands::revert_to_official,
+            commands::get_available_models,
+            // Keys as resources: every key this machine knows, and which clients
+            // are bound to each. Reads the live config, writes through the same
+            // switch the provider page uses.
+            commands::relay_credentials,
+            commands::relay_bind,
+            commands::relay_restart_claude_desktop,
             commands::get_relay_balance,
+            // Console session: sign in / out and read who we are. The tokens never
+            // leave Rust, which is what makes the session survive a page switch or
+            // a WebView reload.
+            commands::relay_session_status,
+            commands::relay_login,
+            commands::relay_logout,
+            commands::relay_refresh_session,
+            // Keys: one click does create → install → verify. The frontend does not
+            // orchestrate it, because a partial result would leave the UI guessing
+            // which half succeeded.
+            commands::relay_keys_list,
+            commands::relay_key_install,
+            commands::relay_key_rotate,
+            commands::relay_key_disable,
+            // Overview: one call, four independently-failing blocks.
+            commands::relay_overview,
             commands::get_relay_models,
             commands::get_autostart,
             commands::set_autostart,
@@ -2112,11 +2312,73 @@ fn window_state_flags() -> StateFlags {
 
 /// 当前应用的退出路径会拦截 `ExitRequested` 并最终直接 `std::process::exit(0)`，
 /// 这里需要在真正结束进程前手动落盘，避免 window-state 插件的默认退出钩子被绕过。
+///
+/// # Why a failure here is not just noisy
+///
+/// The window-state plugin resolves its target through `app.path().app_config_dir()`,
+/// which is `dirs::config_dir()/${identifier}` and returns `Error::UnknownPath` when
+/// `dirs` cannot resolve the folder. Every path that reaches the failure returns
+/// *before* writing anything, so the user's window geometry silently stops being
+/// remembered — and, on the restart path, the error is the loudest line in the log
+/// while the process is about to exit.
+///
+/// Measured on this machine: `退出前保存窗口状态失败: unknown path` appears only for
+/// runs whose exe lives outside the normal install location (`E:\updtest\...`,
+/// `E:\smoke108\...`). Those are acceptance copies, and the pairing is the useful
+/// detail: resolution depends on how the process was started, not on the build.
+///
+/// The fix is to place the state file ourselves when the plugin cannot, rather than
+/// leaving the feature quietly dead. `panic_hook` already owns a config directory
+/// derived from `dirs::home_dir()` with a `.` fallback, so this writes to exactly
+/// the directory the app already uses for logs and the database.
 pub fn save_window_state_before_exit(app_handle: &tauri::AppHandle) {
-    if let Err(err) = app_handle.save_window_state(window_state_flags()) {
-        log::error!("退出前保存窗口状态失败: {err}");
-    } else {
-        log::info!("已在退出前保存窗口状态");
+    match app_handle.save_window_state(window_state_flags()) {
+        Ok(()) => log::info!("已在退出前保存窗口状态"),
+        Err(err) => {
+            log::warn!("window-state 插件无法保存（{err}），改用应用自己的目录写入");
+            save_window_state_fallback(app_handle, &err.to_string());
+        }
+    }
+}
+
+/// Write the same `.window-state.json` shape the plugin uses, into the directory
+/// this app controls.
+///
+/// Deliberately best-effort and quiet: a tray tool that cannot remember a window
+/// position is mildly annoying, and making that a startup blocker would be worse.
+fn save_window_state_fallback(app_handle: &tauri::AppHandle, cause: &str) {
+    let Some(window) = app_handle.get_webview_window("main") else {
+        return;
+    };
+    let Ok(position) = window.outer_position() else {
+        return;
+    };
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let maximized = window.is_maximized().unwrap_or(false);
+
+    let value = serde_json::json!({
+        "main": {
+            "width": size.width,
+            "height": size.height,
+            "x": position.x,
+            "y": position.y,
+            "maximized": maximized,
+        }
+    });
+
+    let path = crate::config::get_app_config_dir().join(".window-state.json");
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("创建窗口状态目录失败: {e}（原始错误: {cause}）");
+            return;
+        }
+    }
+    let write = std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap_or_default());
+    match write {
+        Ok(()) => log::info!("窗口状态已写入 {}", path.display()),
+        Err(e) => log::warn!("写窗口状态失败: {e}（原始错误: {cause}）"),
     }
 }
 
@@ -2140,13 +2402,188 @@ pub fn destroy_single_instance_lock(app_handle: &tauri::AppHandle) {
 /// 有意不调 `AppHandle::cleanup_before_exit()`：它会在调用线程上 Drop 托盘
 /// 图标，而 macOS 的 NSStatusItem 操作要求主线程；`set_visible(false)` 走
 /// `run_item_main_thread` 代理，跨线程安全（见 `remove_tray_icon_before_exit`）。
+///
+/// # Why this does not use `tauri::process::restart`
+///
+/// `tauri::process::restart` is `Command::new(current_binary).spawn()` followed by
+/// `exit(0)` — and it **logs a failed spawn and exits anyway**:
+///
+/// ```text
+/// if let Err(e) = Command::new(path)...spawn() { log::error!("failed to restart app: {e}"); }
+/// exit(0);
+/// ```
+///
+/// For an updater that is the worst possible failure. The old exe has already been
+/// renamed aside, the new one is in place, and if the new one cannot start — a
+/// quarantined download, a missing `WebView2Loader.dll`, a virus scanner holding
+/// the file, a partially written payload — this process exits with nothing left
+/// running. The tray icon is gone, there is no console, no window, and autostart
+/// is the only thing that will bring it back at the next sign-in. From the user's
+/// side the app simply vanished after updating, which is exactly the report this
+/// change exists to answer.
+///
+/// So: spawn it ourselves, wait briefly to see whether it survives, and only exit
+/// once the replacement is confirmed alive. If it dies, relaunch the `.old` copy
+/// the updater kept for this cycle, and if that fails too, keep *this* process
+/// running (it still has the tray icon) and say so in the log rather than going
+/// dark.
+fn relaunch_detached(exe: &std::path::Path, args: &[std::ffi::OsString]) -> std::io::Result<u32> {
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    // A new process group: otherwise a Ctrl+C on a parent console (or a job object
+    // that owns this process) can take the replacement down with us.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    Ok(command.spawn()?.id())
+}
+
+/// Is the freshly spawned replacement still alive after a short settling period?
+///
+/// This is the cheapest available proof that it did not die on startup and is
+/// worth more than it looks: a successful `spawn` only proves the loader accepted
+/// the file. A missing dependency, an incompatible CPU baseline, or an immediate
+/// panic in `setup` all show up as "exited within a second".
+#[cfg(windows)]
+fn replacement_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Cannot open it: it is already gone (or was never scheduled).
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        ok && code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(windows))]
+fn replacement_is_alive(pid: u32) -> bool {
+    // `kill(pid, 0)` is the portable liveness probe on Unix.
+    pid != 0 && std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// How long to let a replacement prove itself before exiting the old process.
+///
+/// Short enough that a normal restart still feels instant, long enough to catch a
+/// process that dies in `setup` — which is where the crash log shows this app's
+/// failures happen.
+const REPLACEMENT_GRACE: std::time::Duration = std::time::Duration::from_millis(1200);
+
 pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
     remove_tray_icon_before_exit(app_handle);
     destroy_single_instance_lock(app_handle);
+
     let env = app_handle.env();
     #[cfg(target_os = "macos")]
     relaunch_macos_bundle(&env);
-    tauri::process::restart(&env);
+
+    let binary = match tauri::process::current_binary(&env) {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("无法定位当前可执行文件，重启中止（保留当前进程）: {e}");
+            std::process::exit(0);
+        }
+    };
+    let args: Vec<std::ffi::OsString> = env.args_os.iter().skip(1).cloned().collect();
+
+    match relaunch_detached(&binary, &args) {
+        Ok(pid) => {
+            std::thread::sleep(REPLACEMENT_GRACE);
+            if replacement_is_alive(pid) {
+                log::info!("新进程 pid={pid} 已接管，退出当前进程");
+                std::process::exit(0);
+            }
+            log::error!(
+                "新进程 pid={pid} 启动后立即退出（{}），回滚到上一份可执行文件",
+                binary.display()
+            );
+
+            // The updater keeps `<exe>.old` for exactly one cycle. On Windows the
+            // running image is locked, so the copy has to be renamed *back* into
+            // place rather than overwriting.
+            if let Some(restored) = restore_previous_exe(&binary) {
+                match relaunch_detached(&restored, &args) {
+                    Ok(pid) => {
+                        std::thread::sleep(REPLACEMENT_GRACE);
+                        if replacement_is_alive(pid) {
+                            log::warn!("已回滚并用上一版本 pid={pid} 重新启动");
+                            std::process::exit(0);
+                        }
+                    }
+                    Err(e) => log::error!("回滚版本也无法启动: {e}"),
+                }
+            }
+
+            // Nothing we launched stayed up. Do NOT exit: this process is the only
+            // thing keeping the tray icon (and therefore any way back in) alive.
+            // Falling asleep forever is intentional — the alternative is a machine
+            // with no process, and no UI that could ever report the problem.
+            log::error!("重启与回滚均失败；保留当前进程以避免应用彻底消失");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "无法启动新进程（{e}）；保留当前进程，问题可在日志里追溯，应用不会静默消失"
+            );
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+    }
+}
+
+/// Put the retained previous binary back under the expected name.
+///
+/// Mirrors the updater's own rename dance in reverse: the live name is moved to
+/// `.failed` first, the `.old` copy is moved into the live name, and the failed
+/// payload is left on disk for diagnosis. Returns the path to launch, or `None`
+/// when there is nothing to roll back to.
+fn restore_previous_exe(live: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn sibling(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    }
+
+    let old = sibling(live, ".old");
+    if !old.is_file() {
+        log::error!("没有可回滚的 {}，无法自动恢复", old.display());
+        return None;
+    }
+    let failed = sibling(live, ".failed");
+    let _ = std::fs::remove_file(&failed);
+    // The old process image is mapped; renaming is allowed, deleting is not. We are
+    // still running THAT image, so it must not be overwritten either.
+    if let Err(e) = std::fs::rename(live, &failed) {
+        log::error!("无法把失败的新版本移开（{e}），回滚中止");
+        return None;
+    }
+    match std::fs::rename(&old, live) {
+        Ok(()) => {
+            log::warn!("已把上一版本恢复到 {}", live.display());
+            Some(live.to_path_buf())
+        }
+        Err(e) => {
+            log::error!("把上一版本恢复回原位置失败: {e}");
+            // Leave the tree as close to working as possible.
+            let _ = std::fs::rename(&failed, live);
+            None
+        }
+    }
 }
 
 /// macOS 经 LaunchServices（`open -n`）启动新实例，成功即退出；失败时返回，
@@ -2178,5 +2615,127 @@ fn relaunch_macos_bundle(env: &tauri::Env) {
         Ok(status) if status.success() => std::process::exit(0),
         Ok(status) => log::warn!("open -n 重启失败（{status}），回落直接启动"),
         Err(err) => log::warn!("open -n 重启失败（{err}），回落直接启动"),
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use std::path::{Path, PathBuf};
+
+    /// Telling "the machine started us" from "the user clicked us".
+    ///
+    /// This drives a user-visible decision in the single-instance callback: a bare
+    /// launch raises the window (because a double-clicked icon that does nothing
+    /// looks broken), while an autostart launch must stay silent (nobody wants a
+    /// window in their face at sign-in).
+    ///
+    /// Both directions are asserted because getting it backwards is invisible in a
+    /// smoke test — the app still starts, it just behaves wrongly at login or when
+    /// clicked.
+    #[test]
+    fn autostart_launches_are_recognised_and_user_clicks_are_not() {
+        // What `auto_launch` writes into the Run key.
+        assert!(super::argv_is_autostart(&[
+            r"C:\Apps\AimyriaOne.exe".to_string(),
+            "--autostart".to_string()
+        ]));
+        // Tolerated shapes: different case, no path prefix, slash form.
+        assert!(super::argv_is_autostart(&["--AUTOSTART".to_string()]));
+        assert!(super::argv_is_autostart(&["/autostart".to_string()]));
+        assert!(super::argv_is_autostart(&["  --autostart  ".to_string()]));
+
+        // A double-click carries nothing — this is the case that must raise the UI.
+        assert!(!super::argv_is_autostart(&[]));
+        // A deep link is a request in its own right, not an autostart.
+        assert!(!super::argv_is_autostart(&[
+            "aimyria://v1/import?resource=provider".to_string()
+        ]));
+        // Prefix matching must not accept a different flag.
+        assert!(!super::argv_is_autostart(&["--autostart-now".to_string()]));
+    }
+
+    fn sibling(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    /// The rollback has to put the *previous* binary back under the live name,
+    /// and keep the failed payload on disk for diagnosis.
+    ///
+    /// This is the last line of defence for the reported failure: "it updated,
+    /// then never started again". The updater renames the old exe to `.old`, so
+    /// the only way back is to rename it in again. Without this test, a future
+    /// change to the suffix convention would silently disable the recovery path.
+    #[test]
+    fn rollback_restores_the_previous_binary() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let live = dir.path().join("AimyriaOne.exe");
+        let old = sibling(&live, ".old");
+
+        std::fs::write(&live, b"broken new version").unwrap();
+        std::fs::write(&old, b"known good version").unwrap();
+
+        let restored = super::restore_previous_exe(&live).expect("rollback should succeed");
+
+        assert_eq!(restored, live, "the restored path is the live name");
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"known good version",
+            "the previous binary must be back in place"
+        );
+        assert_eq!(
+            std::fs::read(sibling(&live, ".failed")).unwrap(),
+            b"broken new version",
+            "the failed payload must be kept for diagnosis"
+        );
+        assert!(!old.exists(), ".old was consumed by the restore");
+    }
+
+    /// With nothing to roll back to, the function must report that instead of
+    /// pretending the live file is healthy.
+    #[test]
+    fn rollback_without_a_previous_binary_reports_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let live = dir.path().join("AimyriaOne.exe");
+        std::fs::write(&live, b"only version").unwrap();
+
+        assert!(super::restore_previous_exe(&live).is_none());
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"only version",
+            "the live file must be untouched when there is nothing to restore"
+        );
+    }
+
+    /// A `.old` that is a directory, not a file, is not a usable rollback source.
+    #[test]
+    fn rollback_ignores_a_non_file_previous_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let live = dir.path().join("AimyriaOne.exe");
+        std::fs::write(&live, b"live").unwrap();
+        std::fs::create_dir(sibling(&live, ".old")).unwrap();
+
+        assert!(super::restore_previous_exe(&live).is_none());
+    }
+
+    /// The liveness probe must be able to see *this* process, or every restart
+    /// would look like a failure and take the rollback path.
+    #[test]
+    fn the_liveness_probe_sees_a_running_process() {
+        let me = std::process::id();
+        assert!(
+            super::replacement_is_alive(me),
+            "the probe must recognise a process that is definitely running"
+        );
+    }
+
+    /// A pid that cannot exist must read as dead. Guarding this matters: if the
+    /// probe returned true for everything, a stillborn replacement would be
+    /// accepted and the old process would exit anyway — the original bug.
+    #[test]
+    fn the_liveness_probe_rejects_an_impossible_pid() {
+        // u32::MAX is not a valid pid on any supported platform.
+        assert!(!super::replacement_is_alive(u32::MAX));
     }
 }

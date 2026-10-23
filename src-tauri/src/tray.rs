@@ -2221,13 +2221,25 @@ pub fn take_tray_navigation() -> Option<TrayNavigation> {
 /// 显示并聚焦主窗口；轻量模式下重建窗口。
 pub fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = window.set_skip_taskbar(false);
-        }
+        // Order: show first, then claim the taskbar button.
+        //
+        // `set_skip_taskbar(false)` is `ITaskbarList::AddTab`, a COM call that
+        // registers the window with the shell. Called on a hidden window it can be
+        // dropped (§ see `window_policy`): the shell has no live slot to add to.
+        // Showing first is also what makes the button appear in one step instead
+        // of flashing a window without one.
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+
+        #[cfg(target_os = "windows")]
+        {
+            // A visible window must own a taskbar button — that is the most
+            // discoverable way back, and its absence is what made this app
+            // unreachable from the taskbar.
+            let _ = window.set_skip_taskbar(false);
+        }
+
         #[cfg(target_os = "linux")]
         {
             crate::linux_fix::nudge_main_window(window.clone(), "tray-show-main");
@@ -2235,6 +2247,14 @@ pub fn show_main_window(app: &tauri::AppHandle) {
         #[cfg(target_os = "macos")]
         {
             apply_tray_policy(app, true);
+        }
+
+        // The tray icon may have been hidden by the "show in tray" setting; a
+        // window that is now on screen is its own entry point, so nothing to
+        // restore. If the user disabled the tray icon, make sure the button is
+        // definitely there, since it is the only way back once the window hides.
+        if !crate::settings::get_settings().show_in_tray {
+            log::info!("托盘图标已按设置隐藏；窗口的任务栏按钮是本机唯一入口");
         }
     } else if crate::lightweight::is_lightweight_mode() {
         if let Err(e) = crate::lightweight::exit_lightweight_mode(app) {
